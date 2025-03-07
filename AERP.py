@@ -2,83 +2,124 @@ import meshtastic
 import time
 import json
 import threading
-import os
+import logging
 import argparse
-from meshtastic.util import get_lora_config
+import math
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class AERP:
-    def __init__(self, interface, log_file="emergency_log.json"):
+    def __init__(self, interface, config_file="aerp_config.json"):
         self.interface = interface
-        self.emergency_active = False
-        self.emergency_data = {}
-        self.emergency_queue = []
+        self.config_file = config_file
         self.emergency_thread = None
-        self.user_id = interface.meshtastic.getMyNodeInfo()['num']
-        self.log_file = log_file
-        self.lora_config = get_lora_config(interface.meshtastic)
-
-    def activate_emergency(self, message="Emergency! Need assistance.", gps_location=None):
-        if self.emergency_active:
-            print("Emergency already active.")
-            return
-
-        self.emergency_active = True
-        self.emergency_data = {
-            "type": "emergency",
-            "user_id": self.user_id,
-            "message": message,
-            "gps_location": gps_location,
-            "timestamp": time.time()
-        }
-        self.emergency_queue.append(self.emergency_data)
-        self.emergency_thread = threading.Thread(target=self._send_emergency_broadcast)
-        self.emergency_thread.start()
-        print("Emergency activated.")
-
-    def deactivate_emergency(self):
-        if not self.emergency_active:
-            print("Emergency not active.")
-            return
-
+        self.load_config()
         self.emergency_active = False
-        print("Emergency deactivated.")
+        self.user_id = interface.meshtastic.getMyNodeInfo()['num']
+        self.acknowledgements = {}  # Store acknowledgements
+
+    def load_config(self):
+        try:
+            with open(self.config_file, "r") as f:
+                self.config = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(f"AERP: Error loading config: {e}")
+            self.config = {}
+
+    def start_emergency(self):
+        if not self.emergency_active:
+            self.emergency_active = True
+            self.emergency_thread = threading.Thread(target=self._send_emergency_broadcast)
+            self.emergency_thread.start()
+            logging.info("AERP: Emergency broadcast started.")
+
+    def stop_emergency(self):
+        if self.emergency_active:
+            self.emergency_active = False
+            if self.emergency_thread:
+                self.emergency_thread.join(timeout=2)
+            logging.info("AERP: Emergency broadcast stopped.")
 
     def _send_emergency_broadcast(self):
-        while self.emergency_active and self.emergency_queue:
+        while self.emergency_active:
             try:
-                data = self.emergency_queue[0]
-                self.interface.sendData(data, portNum=meshtastic.constants.DATA_APP)
-                time.sleep(self.lora_config.tx_delay)
-                self.emergency_queue.pop(0)
+                gps = self.interface.meshtastic.getGps()
+                battery = self.interface.meshtastic.getBatteryLevel()
+                message = {
+                    "type": "emergency",
+                    "user_id": self.user_id,
+                    "message": self.config.get("emergency_message", "Emergency!"),
+                    "gps": gps,
+                    "battery": battery,
+                    "timestamp": time.time(),
+                }
+                self.interface.sendData(message, portNum=self.config.get("emergency_port", meshtastic.constants.DATA_APP))
+                time.sleep(self.config.get("interval", 10))
             except Exception as e:
-                print(f"Error sending emergency broadcast: {e}")
+                logging.error(f"AERP: Error in emergency broadcast: {e}")
 
     def handle_incoming(self, packet, interface):
-        if packet['decoded']['portNum'] == meshtastic.constants.DATA_APP:
+        if packet['decoded']['portNum'] == self.config.get("emergency_port", meshtastic.constants.DATA_APP):
             decoded = packet['decoded']['payload']
             if decoded.get("type") == "emergency":
-                print(f"Emergency received: {decoded}")
-                self.log_emergency(decoded) #UI integration point.
+                logging.warning(f"AERP: Emergency message received from {packet['from']}: {decoded}")
+                # Send acknowledgement
+                ack_message = {
+                    "type": "ack",
+                    "original_user_id": decoded["user_id"],
+                    "timestamp": time.time(),
+                }
+                interface.sendData(ack_message, destAddr=packet['from'], portNum=self.config.get("emergency_port", meshtastic.constants.DATA_APP))
+                self.check_alert_radius(packet)
+            elif decoded.get("type") == "ack":
+                if decoded.get("original_user_id") == self.user_id:
+                    self.acknowledgements[packet['from']] = time.time()
+                    logging.info(f"AERP: Acknowledgement received from {packet['from']}")
 
-    def log_emergency(self, data):
-        try:
-            if not os.path.exists(self.log_file):
-                with open(self.log_file, 'w') as f:
-                    f.write('[]')
-
-            with open(self.log_file, 'r+') as f:
-                file_data = json.load(f)
-                file_data.append(data)
-                f.seek(0)
-                json.dump(file_data, f, indent=4)
-        except Exception as e:
-            print(f"Error logging emergency data: {e}")
+    def handle_user_input(self):
+        while True:
+            user_input = input("AERP: Enter 'start' or 'stop' to control emergency broadcast (or 'exit' to quit): ").lower()
+            if user_input == "start":
+                self.start_emergency()
+            elif user_input == "stop":
+                self.stop_emergency()
+            elif user_input == "exit":
+                self.stop_emergency()
+                break
+            else:
+                print("AERP: Invalid input.")
 
     def onConnection(self, interface, connected):
         if connected:
-            print("AERP: Meshtastic connected.")
+            logging.info("AERP: Meshtastic connected.")
         else:
-            print("AERP: Meshtastic disconnected.")
+            logging.info("AERP: Meshtastic disconnected.")
+            self.stop_emergency()
+
+    def check_alert_radius(self, packet):
+        if packet['decoded']['portNum'] == meshtastic.constants.DATA_APP:
+            decoded = packet['decoded']['payload']
+            if decoded.get("gps"):
+                my_gps = self.interface.meshtastic.getGps()
+                if my_gps:
+                    distance = self.calculate_distance(my_gps, decoded["gps"])
+                    if distance <= self.config.get("alert_radius", 1000):  # 1000 meters default.
+                        logging.warning(f"AERP: Device {packet['from']} within alert radius: {decoded}")
+
+    def calculate_distance(self, gps1, gps2):
+        try:
+            lat1, lon1 = gps1["latitude"], gps1["longitude"]
+            lat2, lon2 = gps2["latitude"], gps2["longitude"]
+            R = 6371000  # Radius of the Earth in meters
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+            a = math.sin(dlat / 2) * math.sin(dlat / 2) + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) * math.sin(dlon / 2)
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            distance = R * c
+            return distance
+        except Exception as e:
+            logging.error(f"AERP: Error calculating distance: {e}")
+            return float('inf')
 
 def onReceive(packet, interface):
     aerp.handle_incoming(packet, interface)
@@ -88,14 +129,16 @@ def onConnection(interface, connected):
 
 def main():
     parser = argparse.ArgumentParser(description="Akita Emergency Response Plugin")
-    parser.add_argument("--log", default="emergency_log.json", help="Log file name")
+    parser.add_argument("--config", default="aerp_config.json", help="AERP config file")
     args = parser.parse_args()
 
     interface = meshtastic.SerialInterface()
     global aerp
-    aerp = AERP(interface, args.log)
+    aerp = AERP(interface, args.config)
     interface.addReceiveCallback(onReceive)
     interface.addConnectionCallback(onConnection)
+
+    aerp.handle_user_input()
 
 if __name__ == '__main__':
     main()
