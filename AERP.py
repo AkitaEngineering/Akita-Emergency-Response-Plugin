@@ -5,6 +5,7 @@ import threading
 import logging
 import argparse
 import math
+import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -17,14 +18,32 @@ class AERP:
         self.emergency_active = False
         self.user_id = interface.meshtastic.getMyNodeInfo()['num']
         self.acknowledgements = {}  # Store acknowledgements
+        self.ack_timeout = 60 # seconds
 
     def load_config(self):
         try:
+            if not os.path.exists(self.config_file):
+                with open(self.config_file, "w") as f:
+                    json.dump({
+                        "interval": 5,
+                        "emergency_port": 3,
+                        "emergency_message": "HELP! Emergency situation detected.",
+                        "alert_radius": 500
+                    }, f, indent=4)
             with open(self.config_file, "r") as f:
                 self.config = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
+            if not all(key in self.config for key in ["interval", "emergency_port", "emergency_message", "alert_radius"]):
+                raise ValueError("Config file missing required keys.")
+            if not isinstance(self.config["interval"], int) or not isinstance(self.config["emergency_port"], int) or not isinstance(self.config["alert_radius"], int):
+                raise ValueError("Config values must be integers.")
+        except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
             logging.error(f"AERP: Error loading config: {e}")
-            self.config = {}
+            self.config = {
+                "interval": 5,
+                "emergency_port": 3,
+                "emergency_message": "HELP! Emergency situation detected.",
+                "alert_radius": 500
+            }
 
     def start_emergency(self):
         if not self.emergency_active:
@@ -75,6 +94,13 @@ class AERP:
                 if decoded.get("original_user_id") == self.user_id:
                     self.acknowledgements[packet['from']] = time.time()
                     logging.info(f"AERP: Acknowledgement received from {packet['from']}")
+                    self.remove_stale_acks()
+
+    def remove_stale_acks(self):
+        current_time = time.time()
+        stale_acks = [node_id for node_id, timestamp in self.acknowledgements.items() if current_time - timestamp > self.ack_timeout]
+        for node_id in stale_acks:
+            del self.acknowledgements[node_id]
 
     def handle_user_input(self):
         while True:
