@@ -18,6 +18,9 @@ The Akita Emergency Response Plugin (AERP) is a Meshtastic plugin designed to pr
 * **Alert Radius:** Triggers alerts when other Meshtastic devices enter a configurable radius.
 * **Distance Calculation:** Uses the Haversine formula for accurate distance calculations.
 * **Comprehensive Logging:** Provides detailed logs for debugging and monitoring.
+* **Robust Configuration Loading:** Handles missing or invalid configuration files.
+* **Acknowledgement Timeout:** Removes stale acknowledgements.
+* **Config Validation:** Validates the configuration file for required keys and data types.
 
 ## Installation
 
@@ -29,21 +32,16 @@ The Akita Emergency Response Plugin (AERP) is a Meshtastic plugin designed to pr
 
 ## Usage
 
-1.  Start the plugin by running `python aerp.py` from your command line.
-2.  Use the command line interface to start and stop the emergency broadcasts.
-3.  When an emergency message is received, it will be logged in the console.
-4.  When another Meshtastic device enters the alert radius, an alert will be logged.
-5.  When an acknowledgement is received, it will be logged.
+* Start the plugin by running `python aerp.py` from your command line.
+* Use the command line interface to start and stop the emergency broadcasts.
+* When an emergency message is received, it will be logged in the console.
+* When another Meshtastic device enters the alert radius, an alert will be logged.
+* When an acknowledgement is received, it will be logged.
 
 ## Dependencies
 
 * Meshtastic Python API
 * Python 3.6 or later
-
-## Contributing
-
-Contributions are welcome! If you have any suggestions or bug reports, please feel free to submit an issue or pull request.
-
 
 ## Configuration (aerp_config.json)
 
@@ -52,7 +50,7 @@ Contributions are welcome! If you have any suggestions or bug reports, please fe
 * `emergency_message`: The custom emergency message.
 * `alert_radius`: The radius (in meters) within which to trigger alerts.
 
-**Example aerp_config.json:**
+### Example aerp_config.json:
 
 ```json
 {
@@ -61,4 +59,3 @@ Contributions are welcome! If you have any suggestions or bug reports, please fe
     "emergency_message": "HELP! Emergency situation detected.",
     "alert_radius": 500
 }
-
