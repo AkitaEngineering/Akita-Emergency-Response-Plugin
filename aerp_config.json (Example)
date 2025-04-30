@@ -1,6 +1,0 @@
-{
-    "interval": 5,
-    "emergency_port": 3,
-    "emergency_message": "HELP! Emergency situation detected.",
-    "alert_radius": 500  # Meters
-}
