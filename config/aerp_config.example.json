@@ -1,0 +1,8 @@
+{
+    "interval": 60,
+    "emergency_port": 256,
+    "emergency_message": "SOS! Emergency situation detected.",
+    "alert_radius": 1000,
+    "ack_timeout": 300,
+    "plugin_enabled_by_default": false
+}
