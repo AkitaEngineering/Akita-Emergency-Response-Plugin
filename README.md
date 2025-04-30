@@ -209,9 +209,4 @@ akita-emergency-response-plugin/
 
 # Contributing
 
-Contributions that enhance usability, reliability, or add relevant features (especially for SAR) are welcome! Follow standard GitHub practices:
-
-1. **Fork the repository.**
-2. **Create a feature branch**  
-   ```sh
-   git checkout -b feature/your-improvement
+Contributions that enhance usability, reliability, or add relevant features (especially for SAR) are welcome!
