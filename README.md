@@ -67,10 +67,10 @@ akita-emergency-response-plugin/
 
 1.  **Clone the Repository:**
     ```bash
-    git clone [https://github.com/your-username/akita-emergency-response-plugin.git](https://github.com/your-username/akita-emergency-response-plugin.git)
+    git clone [https://github.com/akitaengineering/akita-emergency-response-plugin.git](https://github.com/akitaengineering/akita-emergency-response-plugin.git)
     cd akita-emergency-response-plugin
     ```
-    *(Replace `your-username` with the actual repository location)*
+
 
 2.  **Install Dependencies:**
     ```bash
