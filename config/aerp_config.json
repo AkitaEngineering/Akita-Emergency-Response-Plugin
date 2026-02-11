@@ -1,8 +1,8 @@
 {
-    "interval": 60, // Seconds between emergency broadcasts. Shorter interval = more updates but more battery/channel use.
-    "emergency_port": 256, // Meshtastic port number (0-511). IMPORTANT: All users in a group must use the SAME port. Use private range (256-511).
-    "emergency_message": "SOS! Emergency situation detected.", // Your default alert message. Keep it concise.
-    "alert_radius": 1000, // Radius in meters for proximity alerts. Set to 0 to disable. Useful for finding nearby team members.
-    "ack_timeout": 300, // Seconds before an acknowledgement is considered 'stale' in the status display and for internal cleanup.
-    "plugin_enabled_by_default": false // Set to true to automatically 'start' when the script runs (Use with caution).
+    "interval": 60,
+    "emergency_port": 256,
+    "emergency_message": "SOS! Emergency situation detected.",
+    "alert_radius": 1000,
+    "ack_timeout": 300,
+    "plugin_enabled_by_default": false
 }

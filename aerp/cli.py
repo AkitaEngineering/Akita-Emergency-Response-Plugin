@@ -242,19 +242,9 @@ def run_cli_loop():
                 if aerp_instance:
                     if aerp_instance.emergency_active:
                         logger.warning("Emergency is currently active. Use 'stop' to stop and send clear.")
-                    elif aerp_instance.last_emergency_id:
-                        # Note: stop_emergency clears last_emergency_id.
-                        # This command is mainly useful if stop failed to send clear (e.g., disconnect)
-                        # We need a way to reference the *previous* ID if needed.
-                        # For now, let's assume it clears the ID stored *before* stop was called.
-                        # This needs refinement - maybe store the *last sent* ID separately?
-                        # Current implementation: This command might not work as intended after a 'stop'.
-                        # Re-purposing: Send a generic clear if no ID? Or require ID?
-                        # Decision: Let's make 'clear' less useful for now, 'stop' is primary.
-                        # Alternative: 'clear <id>'? Too complex for simple CLI.
-                        logger.warning("The 'clear' command after 'stop' might not use the correct ID.")
-                        logger.warning("Use 'stop' to ensure the correct 'All Clear' is sent.")
-                        # aerp_instance.send_clear_message(aerp_instance.last_emergency_id) # This ID is likely None now
+                    elif aerp_instance.last_sent_emergency_id:
+                        aerp_instance.send_clear_message(aerp_instance.last_sent_emergency_id)
+                        print(f"All Clear sent for last emergency ID {aerp_instance.last_sent_emergency_id}.")
                     else:
                         logger.info("No previous emergency ID recorded to clear.")
                 else:
@@ -275,7 +265,7 @@ def run_cli_loop():
                 print("\nAvailable Commands:")
                 print("  start   - Start broadcasting emergency messages.")
                 print("  stop    - Stop broadcasting and send 'All Clear'.")
-                # print("  clear   - Manually send 'All Clear' (use 'stop' preferably).")
+                print("  clear   - Manually send 'All Clear' for the last emergency.")
                 print("  status  - Show current status, ACKs, and received alerts.")
                 print("  help    - Show this help message.")
                 print("  exit    - Quit the plugin (stops broadcast first).")

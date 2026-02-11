@@ -76,6 +76,7 @@ class AERP:
         self._emergency_thread = None # Internal thread reference
         self._emergency_lock = threading.Lock() # Protects access to emergency_active and related state
         self.last_emergency_id = None
+        self.last_sent_emergency_id = None
         self.acknowledgements = {}
         self.active_emergency_info = {}
         self.my_node_num = None
@@ -143,6 +144,7 @@ class AERP:
             self.emergency_active = True
             # Initialize the acknowledgement dictionary for this new emergency ID
             self.acknowledgements[self.last_emergency_id] = {}
+            self.last_sent_emergency_id = self.last_emergency_id
 
             logger.warning(f"--- EMERGENCY BROADCAST STARTED (ID: {self.last_emergency_id}) ---")
             logger.info(f"Broadcasting on port {self.config.get(CONFIG_PORT)} every {self.config.get(CONFIG_INTERVAL)} seconds.")
@@ -243,24 +245,22 @@ class AERP:
         try:
             # Send as a broadcast message on the designated AERP port
             self.interface.sendData(
-                # meshtastic library handles JSON encoding for dict payloads
-                payload=json.dumps(message_payload).encode('utf-8'), # Ensure payload is bytes
+                payload=message_payload,
                 portNum=port_num,
                 wantAck=False # Clear messages are typically fire-and-forget
                 # destinationId="^all" # Default broadcast behavior
             )
         except TypeError as e:
-             # Handle potential issue if interface expects specific payload type
              logger.error(f"TypeError sending CLEAR message (check meshtastic library version?): {e}")
-             # Try sending as dict directly (newer versions might handle this)
+             # Try sending as bytes (JSON encoded)
              try:
                   self.interface.sendData(
-                       payload=message_payload,
+                       payload=json.dumps(message_payload).encode('utf-8'),
                        portNum=port_num,
                        wantAck=False
                   )
              except Exception as inner_e:
-                  logger.error(f"Retry sending CLEAR as dict also failed: {inner_e}")
+                  logger.error(f"Retry sending CLEAR as bytes also failed: {inner_e}")
         except AttributeError as e:
              logger.error(f"Meshtastic interface error sending CLEAR: {e}. Is it connected?")
         except Exception as e:
@@ -371,19 +371,18 @@ class AERP:
             try:
                 # Send the data using the Meshtastic interface
                 self.interface.sendData(
-                    # meshtastic library usually handles JSON encoding for dicts
-                    payload=json.dumps(message_payload).encode('utf-8'), # Ensure bytes payload
+                    payload=message_payload,
                     portNum=port_num,
                     # wantAck=False # Default, ACKs are handled by the plugin logic
                     # channelIndex=0 # Specify channel if needed
                 )
             except TypeError as e:
                  logger.error(f"TypeError sending EMERGENCY message: {e}")
-                 # Try sending as dict
+                 # Try sending as bytes
                  try:
-                      self.interface.sendData(payload=message_payload, portNum=port_num)
+                      self.interface.sendData(payload=json.dumps(message_payload).encode('utf-8'), portNum=port_num)
                  except Exception as inner_e:
-                      logger.error(f"Retry sending EMERGENCY as dict also failed: {inner_e}")
+                      logger.error(f"Retry sending EMERGENCY as bytes also failed: {inner_e}")
             except AttributeError as e:
                  logger.error(f"Meshtastic interface error sending EMERGENCY: {e}. Is it connected?")
             except Exception as e:
@@ -612,23 +611,23 @@ class AERP:
             destination_id_str = f"!{destination_node_num:08x}"
 
             self.interface.sendData(
-                payload=json.dumps(ack_payload).encode('utf-8'), # Ensure bytes payload
+                payload=ack_payload,
                 destinationId=destination_id_str,
                 portNum=port_num,
                 wantAck=False # ACKs usually don't need their own ACK (prevents ACK loops)
             )
         except TypeError as e:
              logger.error(f"TypeError sending ACK message to {dest_node_id_fmt}: {e}")
-             # Try sending as dict
+             # Try sending as bytes
              try:
                   self.interface.sendData(
-                       payload=ack_payload,
+                       payload=json.dumps(ack_payload).encode('utf-8'),
                        destinationId=destination_id_str,
                        portNum=port_num,
                        wantAck=False
                   )
              except Exception as inner_e:
-                  logger.error(f"Retry sending ACK as dict also failed: {inner_e}")
+                  logger.error(f"Retry sending ACK as bytes also failed: {inner_e}")
         except AttributeError as e:
              logger.error(f"Meshtastic interface error sending ACK: {e}. Is it connected?")
         except Exception as e:
