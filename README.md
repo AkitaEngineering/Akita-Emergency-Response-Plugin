@@ -1,234 +1,155 @@
 # Akita Emergency Response Plugin (AERP) for Meshtastic
 
-AERP is a Python application that helps teams share emergency alerts, location, and acknowledgements over a Meshtastic mesh network. It's aimed at Search & Rescue (SAR), disaster response, and remote-group safety use cases.
+AERP is a host-side Python CLI for sending emergency alerts, acknowledgements, and all-clear messages over a Meshtastic mesh. It is aimed at Search & Rescue (SAR), disaster response, and remote teams that want a simple laptop or single-board-computer workflow attached to a Meshtastic radio.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 Website: https://www.akitaengineering.com
 
-## Key Features
+## Current Status
 
-- Start/stop emergency broadcasts with a unique emergency ID.
-- Broadcast message, GPS (if available), and battery level periodically.
-- Automatic acknowledgements (ACK) from receiving nodes.
-- Manual or automatic "All Clear" (`stop`) to signal resolution.
-- Proximity alerts when other nodes are within a configured radius.
-- Simple CLI with `start`, `stop`, `clear`, `status`, and `help`.
+- Emergency, ACK, and CLEAR messages are sent as JSON bytes using the current Meshtastic Python API.
+- Incoming alerts work with both raw private-port numbers and Meshtastic's `PRIVATE_APP` alias.
+- Proximity alerts recognize standard Meshtastic `decoded.position` packets.
+- Local GPS and battery telemetry are read from Meshtastic's node database when available.
+
+## Why This Is Not an ESP-IDF Port
+
+This repository is an external operator tool, not a Meshtastic firmware module. Converting it to ESP-IDF would mean maintaining custom device firmware or integrating directly into Meshtastic itself.
+
+For most SAR teams, the current host-side approach is the safer choice:
+
+- easier to update and validate before deployment
+- easier to log operator actions during incidents
+- no custom firmware maintenance burden on every field radio
+- works with existing Meshtastic hardware and Python tooling
+
+If you eventually need fully autonomous on-device alerting with no attached host, that should be a separate firmware project rather than a direct conversion of this CLI.
+
+## Requirements
+
+- Python `>=3.9,<3.15` to match the current `meshtastic` package requirement
+- a Meshtastic radio connected over serial or reachable over TCP
+- dependencies from `requirements.txt`
 
 ## Quick Start
 
-1. Clone the repository:
+1. Clone the repository.
 
 ```bash
 git clone https://github.com/AkitaEngineering/Akita-Emergency-Response-Plugin.git
 cd Akita-Emergency-Response-Plugin
 ```
 
-2. Create and activate a virtual environment, then install dependencies:
+2. Create and activate a virtual environment, then install dependencies.
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate    # Windows
-# or: source .venv/bin/activate  # macOS / Linux
-
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Copy the example config and edit as needed:
+3. Copy a config template.
 
 ```bash
-copy config\aerp_config.example.json config\aerp_config.json    # Windows
-# or: cp config/aerp_config.example.json config/aerp_config.json  # macOS / Linux
+cp config/aerp_config.example.json config/aerp_config.json
 ```
 
-4. Run the CLI (auto-detect serial by default):
+For a SAR-oriented starting profile, use:
+
+```bash
+cp config/aerp_config.sar.example.json config/aerp_config.json
+```
+
+4. Run the CLI.
 
 ```bash
 python -m aerp.cli --config config/aerp_config.json
 ```
 
-For TCP:
+For TCP-connected devices:
 
 ```bash
 python -m aerp.cli --host <ip_or_hostname> --config config/aerp_config.json
 ```
 
+For an explicit serial device path:
+
+```bash
+python -m aerp.cli --device /dev/ttyUSB0 --config config/aerp_config.json
+```
+
+For detailed troubleshooting output:
+
+```bash
+python -m aerp.cli --device /dev/ttyUSB0 --config config/aerp_config.json --debug
+```
+
+If the config file does not exist, AERP creates a default JSON config at the path passed to `--config`.
+
+## Connection Modes
+
+- `--device /path/to/serial`: connect to a radio over a specific serial device.
+- `--host <ip_or_hostname>`: connect to a Meshtastic TCP endpoint.
+- `--no-serial`: skip serial autodetect when you only want TCP.
+- `--debug`: enable verbose logging for connection and packet handling.
+
 ## CLI Commands
 
-- `start` — Start broadcasting emergency messages.
-- `stop` — Stop broadcasting and send an "All Clear" for the last emergency.
-- `clear` — Manually send an "All Clear" for the most recently sent emergency (useful if `stop` failed).
-- `status` — Show current status, acknowledgements, and active received alerts.
-- `help` — Show help.
-- `exit` / `quit` — Quit the plugin.
+- `start` starts broadcasting emergency messages.
+- `stop` stops broadcasting and sends an all-clear for the active emergency.
+- `clear` sends an all-clear for the last sent emergency when no broadcast is active.
+- `status` prints local state, received ACKs, and active inbound emergencies.
+- `help` prints command help.
+- `exit` or `quit` stops the CLI.
 
 ## Configuration
 
-Edit `config/aerp_config.json` to configure behavior. Example keys:
+Edit `config/aerp_config.json` with these keys:
 
-- `interval`: seconds between broadcasts (integer > 0)
-- `emergency_port`: Meshtastic port number (0–511). All nodes must use the same port.
-- `emergency_message`: default emergency text.
-- `alert_radius`: proximity alert radius in meters (0 disables alerts).
-- `ack_timeout`: seconds before received ACKs are considered stale.
-- `plugin_enabled_by_default`: if true, plugin attempts to auto-start on launch.
+- `interval`: seconds between broadcasts, must be greater than `0`
+- `emergency_port`: Meshtastic port number from `0` to `511`; all participating nodes must match
+- `emergency_message`: default alert text
+- `alert_radius`: proximity-alert radius in meters; `0` disables it
+- `ack_timeout`: seconds before an ACK is considered stale
+- `plugin_enabled_by_default`: auto-start emergency broadcasting on launch when `true`
 
-Note: `config/aerp_config.json` must be valid JSON (no comments). See `config/aerp_config.example.json`.
+The file must be valid JSON with no comments.
 
+## Suggested Operator Workflow
 
-## Notes & Considerations
+1. Confirm the radio is connected and has the correct Meshtastic channel and team port.
+2. Start AERP and run `status` to verify the local node ID is available.
+3. Use `start` only for a real drill or incident; AERP begins recurring broadcasts immediately.
+4. Watch `status` for acknowledgements and other active emergencies on the mesh.
+5. Use `stop` when the incident is over so AERP halts broadcasts and sends `AERP_CLEAR`.
+6. If the process restarts after a resolved incident, use `clear` only when you need to manually clear the last recorded emergency ID.
 
-- Test thoroughly with your Meshtastic hardware before relying on AERP in real emergencies.
-- Frequent broadcasts consume power; balance `interval` with battery constraints.
-- Meshtastic/LoRa is line-of-sight dependent; coverage is not guaranteed.
-- Ensure all team members use the same `emergency_port`.
+## SAR Deployment Guidance
+
+- Pick a dedicated team port in the private range and standardize it across every node. The SAR example uses `300` to avoid relying on Meshtastic's generic `PRIVATE_APP` default.
+- Keep the broadcast interval between `30` and `60` seconds unless you have tested battery impact under realistic field conditions.
+- Set `ack_timeout` to at least `3x` the broadcast interval so brief network fades do not make acknowledgements look stale.
+- Configure a fixed position on radios that may operate without live GPS. AERP can only include location that Meshtastic already knows about.
+- Run the CLI on stable, field-chargeable hardware such as a rugged laptop or Raspberry Pi with a power bank.
+- Perform radio-to-radio drills before deployment. LoRa coverage, terrain shadowing, and node placement matter more than application logic.
+
+## Troubleshooting
+
+- If the CLI cannot determine the local node ID, wait a few seconds after connecting and run `status` again.
+- If alerts are not received, verify every participant uses the same `emergency_port` and Meshtastic channel.
+- If acknowledgements appear to expire too quickly, increase `ack_timeout` relative to `interval`.
+- If GPS is missing from alerts, confirm the radio has either live GPS or a configured fixed position in Meshtastic.
+- If serial autodetect fails, retry with `--device /dev/ttyUSB0` or the correct platform-specific device path.
+
+## Validation
+
+Run the built-in regression checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 (GPLv3). See the `LICENSE` file for details.
-
----
-
-If you'd like, I can also add a short `CONTRIBUTING.md`, unit tests, or a GitHub Actions CI workflow to run linting and tests.
-
-<!-- Project structure removed. See package directories `aerp/` and `config/` for layout. -->
-
-## Dependencies
-
-* Python 3.7+ (Recommended)
-* [meshtastic-python](https://github.com/meshtastic/python) library (`pip install meshtastic`)
-* [pypubsub](https://pypi.org/project/PyPubSub/) (`pip install pypubsub`) (Often installed as a dependency of `meshtastic`)
-
-## Installation
-
-1.  **Clone the Repository:**
-    ```bash
-    git clone [https://github.com/akitaengineering/akita-emergency-response-plugin.git](https://github.com/akitaengineering/akita-emergency-response-plugin.git)
-    cd akita-emergency-response-plugin
-    ```
-
-
-2.  **Install Dependencies:**
-    ```bash
-    # It's highly recommended to use a Python virtual environment
-    # python -m venv env
-    # source env/bin/activate  # On Linux/macOS
-    # .\env\Scripts\activate   # On Windows
-
-    pip install -r requirements.txt
-    ```
-
-3.  **Configure:**
-    * Copy the example configuration:
-        ```bash
-        cp config/aerp_config.example.json config/aerp_config.json
-        ```
-    * **Edit `config/aerp_config.json`**: Customize settings like the Meshtastic port, default emergency message, broadcast frequency (`interval`), and `alert_radius`. See the "Configuration" section below for details. *Ensure the chosen `emergency_port` doesn't conflict with other Meshtastic apps.*
-
-## Usage
-
-1.  **Connect Meshtastic Device:** Ensure your Meshtastic node is powered on and connected via USB (for serial) or accessible via network (for TCP).
-
-2.  **Run the Plugin:**
-    From the root directory (`akita-emergency-response-plugin/`):
-    ```bash
-    # For Serial connection (auto-detect or specify device)
-    python -m aerp.cli [--device /path/to/serial] [--config path/to/config.json] [--debug]
-
-    # For TCP connection
-    python -m aerp.cli --host <ip_or_hostname> [--config path/to/config.json] [--debug]
-    ```
-    * **Options:**
-         # Akita Emergency Response Plugin (AERP) for Meshtastic
-
-        AERP is a Python application that helps teams share emergency alerts, location, and acknowledgements over a Meshtastic mesh network. It's aimed at Search & Rescue (SAR), disaster response, and remote-group safety use cases.
-
-        [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-
-        Website: https://www.akitaengineering.com
-
-        ## Key Features
-
-        - Start/stop emergency broadcasts with a unique emergency ID.
-        - Broadcast message, GPS (if available), and battery level periodically.
-        - Automatic acknowledgements (ACK) from receiving nodes.
-        - Manual or automatic "All Clear" (`stop`) to signal resolution.
-        - Proximity alerts when other nodes are within a configured radius.
-        - Simple CLI with `start`, `stop`, `clear`, `status`, and `help`.
-
-        ## Quick Start
-
-        1. Clone the repository:
-
-        ```bash
-        git clone https://github.com/AkitaEngineering/Akita-Emergency-Response-Plugin.git
-        cd Akita-Emergency-Response-Plugin
-        ```
-
-        2. Create and activate a virtual environment, then install dependencies:
-
-        ```bash
-        python -m venv .venv
-        .venv\Scripts\activate    # Windows
-        # or: source .venv/bin/activate  # macOS / Linux
-
-        pip install -r requirements.txt
-        ```
-
-        3. Copy the example config and edit as needed:
-
-        ```bash
-        copy config\aerp_config.example.json config\aerp_config.json    # Windows
-        # or: cp config/aerp_config.example.json config/aerp_config.json  # macOS / Linux
-        ```
-
-        4. Run the CLI (auto-detect serial by default):
-
-        ```bash
-        python -m aerp.cli --config config/aerp_config.json
-        ```
-
-        For TCP:
-
-        ```bash
-        python -m aerp.cli --host <ip_or_hostname> --config config/aerp_config.json
-        ```
-
-        ## CLI Commands
-
-        - `start` — Start broadcasting emergency messages.
-        - `stop` — Stop broadcasting and send an "All Clear" for the last emergency.
-        - `clear` — Manually send an "All Clear" for the most recently sent emergency (useful if `stop` failed).
-        - `status` — Show current status, acknowledgements, and active received alerts.
-        - `help` — Show help.
-        - `exit` / `quit` — Quit the plugin.
-
-        ## Configuration
-
-        Edit `config/aerp_config.json` to configure behavior. Example keys:
-
-        - `interval`: seconds between broadcasts (integer > 0)
-        - `emergency_port`: Meshtastic port number (0–511). All nodes must use the same port.
-        - `emergency_message`: default emergency text.
-        - `alert_radius`: proximity alert radius in meters (0 disables alerts).
-        - `ack_timeout`: seconds before received ACKs are considered stale.
-        - `plugin_enabled_by_default`: if true, plugin attempts to auto-start on launch.
-
-        Note: `config/aerp_config.json` must be valid JSON (no comments). See `config/aerp_config.example.json`.
-
-        <!-- Project layout removed. Refer to the `aerp/` and `config/` directories. -->
-
-        ## Notes & Considerations
-
-        - Test thoroughly with your Meshtastic hardware before relying on AERP in real emergencies.
-        - Frequent broadcasts consume power; balance `interval` with battery constraints.
-        - Meshtastic/LoRa is line-of-sight dependent; coverage is not guaranteed.
-        - Ensure all team members use the same `emergency_port`.
-
-        ## License
-
-        This project is licensed under the GNU General Public License v3.0 (GPLv3). See the `LICENSE` file for details.
-
-        ---
-
-        If you'd like, I can also add a short `CONTRIBUTING.md`, unit tests, or a GitHub Actions CI workflow to run linting and tests.
+This project is licensed under the GNU General Public License v3.0 (GPLv3). See `LICENSE` for details.

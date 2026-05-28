@@ -27,17 +27,26 @@ import threading
 import logging
 import uuid
 import json # Needed for sending JSON payloads
+import base64
+import binascii
 from datetime import datetime # For formatting timestamps
 
 # Import pubsub explicitly if direct subscription is needed, though meshtastic usually handles it
 # from pubsub import pub
 
 import meshtastic.util # For PortNum constants if needed
+from meshtastic.protobuf import portnums_pb2
 from .constants import (
     MSG_TYPE_EMERGENCY, MSG_TYPE_ACK, MSG_TYPE_CLEAR,
     CONFIG_INTERVAL, CONFIG_PORT, CONFIG_MESSAGE, CONFIG_RADIUS, CONFIG_ACK_TIMEOUT
 )
-from .utils import calculate_distance, get_location_from_packet, format_node_id
+from .utils import (
+    build_gps_payload,
+    calculate_distance,
+    extract_battery_level,
+    get_location_from_packet,
+    format_node_id,
+)
 from .config import ConfigManager # Type hinting
 
 # Get a logger specific to this module
@@ -116,6 +125,112 @@ class AERP:
             self.my_node_num = None
             self.my_node_id = "Unknown"
             return False
+
+    def _get_local_node_record(self):
+        """Return the local node record from Meshtastic's node database if available."""
+        if not self.interface or not hasattr(self.interface, 'getMyNodeInfo'):
+            return None
+
+        try:
+            node_info = self.interface.getMyNodeInfo()
+            if isinstance(node_info, dict):
+                return node_info
+        except Exception as e:
+            logger.debug(f"Could not load local node record from interface: {e}")
+
+        return None
+
+    def _get_local_position_payload(self):
+        """Build the normalized GPS payload for this node from the node DB when available."""
+        node_info = self._get_local_node_record()
+        if isinstance(node_info, dict):
+            gps_payload = build_gps_payload(node_info.get('position'))
+            if gps_payload:
+                return gps_payload
+
+        legacy_position = getattr(getattr(self.interface, 'myInfo', None), 'position', None)
+        return build_gps_payload(legacy_position)
+
+    def _get_local_battery_level(self):
+        """Return battery level from the local node DB record when telemetry is available."""
+        node_info = self._get_local_node_record()
+        if isinstance(node_info, dict):
+            battery_level = extract_battery_level(node_info.get('deviceMetrics'))
+            if battery_level is not None:
+                return battery_level
+            battery_level = extract_battery_level(node_info.get('device_metrics'))
+            if battery_level is not None:
+                return battery_level
+
+        legacy_metrics = getattr(getattr(self.interface, 'myInfo', None), 'device_metrics', None)
+        return extract_battery_level(legacy_metrics)
+
+    def _configured_port_alias(self):
+        """Return Meshtastic's enum alias for the configured port, if one exists."""
+        try:
+            return portnums_pb2.PortNum.Name(self.config.get(CONFIG_PORT))
+        except ValueError:
+            return None
+
+    def _is_aerp_port(self, packet_port):
+        """Check whether a received packet port matches the configured AERP port."""
+        configured_port = self.config.get(CONFIG_PORT)
+        if packet_port == configured_port or str(packet_port) == str(configured_port):
+            return True
+        configured_alias = self._configured_port_alias()
+        return configured_alias is not None and packet_port == configured_alias
+
+    def _decode_payload(self, payload, from_node_id_fmt, port_num):
+        """Decode a Meshtastic data payload into a JSON dictionary when possible."""
+        if isinstance(payload, dict):
+            return payload
+
+        if isinstance(payload, bytes):
+            raw_payload = payload
+        elif isinstance(payload, str):
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                try:
+                    raw_payload = base64.b64decode(payload, validate=True)
+                except (binascii.Error, ValueError):
+                    logger.debug(
+                        f"Payload from {from_node_id_fmt} on port {port_num} is not JSON and not base64-encoded bytes."
+                    )
+                    return None
+        else:
+            return None
+
+        try:
+            return json.loads(raw_payload.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug(f"Payload from {from_node_id_fmt} on port {port_num} is not valid UTF-8 JSON.")
+            return None
+
+    def _send_aerp_payload(self, message_payload, port_num, description, destination_id="^all", want_ack=False):
+        """Send a JSON-encoded AERP payload using the Meshtastic sendData API."""
+        if not self.interface:
+            logger.error(f"Cannot send {description}: Meshtastic interface is unavailable.")
+            return False
+
+        try:
+            encoded_payload = json.dumps(
+                message_payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode('utf-8')
+            self.interface.sendData(
+                encoded_payload,
+                destinationId=destination_id,
+                portNum=port_num,
+                wantAck=want_ack,
+            )
+            return True
+        except AttributeError as e:
+            logger.error(f"Meshtastic interface error sending {description}: {e}. Is it connected?")
+        except Exception as e:
+            logger.exception(f"Failed to send {description}: {e}")
+        return False
 
     def start_emergency(self):
         """
@@ -242,30 +357,12 @@ class AERP:
         logger.info(f"Sending ALL CLEAR for emergency ID {emergency_id} on port {port_num}")
         logger.debug(f"Clear Payload: {message_payload}")
 
-        try:
-            # Send as a broadcast message on the designated AERP port
-            self.interface.sendData(
-                payload=message_payload,
-                portNum=port_num,
-                wantAck=False # Clear messages are typically fire-and-forget
-                # destinationId="^all" # Default broadcast behavior
-            )
-        except TypeError as e:
-             logger.error(f"TypeError sending CLEAR message (check meshtastic library version?): {e}")
-             # Try sending as bytes (JSON encoded)
-             try:
-                  self.interface.sendData(
-                       payload=json.dumps(message_payload).encode('utf-8'),
-                       portNum=port_num,
-                       wantAck=False
-                  )
-             except Exception as inner_e:
-                  logger.error(f"Retry sending CLEAR as bytes also failed: {inner_e}")
-        except AttributeError as e:
-             logger.error(f"Meshtastic interface error sending CLEAR: {e}. Is it connected?")
-        except Exception as e:
-            # Catch other potential errors during send
-            logger.exception(f"Failed to send CLEAR message: {e}")
+        self._send_aerp_payload(
+            message_payload,
+            port_num,
+            description="CLEAR message",
+            want_ack=False,
+        )
 
     def _send_emergency_broadcast_loop(self):
         """
@@ -295,63 +392,13 @@ class AERP:
                     break # Exit loop if emergency stopped or ID changed
 
             # --- Gather Data ---
-            gps_info = {} # Default to empty dict
-            battery_level = None # Default to None
+            gps_info = self._get_local_position_payload()
+            if not gps_info:
+                logger.debug("Could not get valid GPS position for emergency message.")
 
-            try:
-                # Attempt to get current position from node info (less blocking)
-                # Ensure interface and myInfo are valid
-                if self.interface and hasattr(self.interface, 'myInfo') and self.interface.myInfo:
-                    my_pos = self.interface.myInfo.position
-                    if my_pos and isinstance(my_pos, dict):
-                         # Check for standard integer lat/lon first
-                         if 'latitudeI' in my_pos and 'longitudeI' in my_pos:
-                              lat = my_pos['latitudeI'] / 1e7
-                              lon = my_pos['longitudeI'] / 1e7
-                              # Add other available fields if they exist
-                              gps_info = {
-                                   "latitude": lat,
-                                   "longitude": lon,
-                                   "altitude": my_pos.get('altitude'),
-                                   "time": my_pos.get('time'), # GPS timestamp
-                              }
-                         # Fallback check for float lat/lon (less common now)
-                         elif 'latitude' in my_pos and 'longitude' in my_pos:
-                              gps_info = {
-                                   "latitude": my_pos['latitude'],
-                                   "longitude": my_pos['longitude'],
-                                   "altitude": my_pos.get('altitude'),
-                                   "time": my_pos.get('time'),
-                              }
-
-                if not gps_info: # If position wasn't found in myInfo
-                     # Optional: Could try a more direct/blocking call if essential,
-                     # but prefer non-blocking info for responsiveness.
-                     # gps_data = self.interface.localNode.getGps() # Requires localNode setup
-                     logger.warning("Could not get valid GPS position for emergency message.")
-
-            except AttributeError:
-                 logger.warning("Could not access interface.myInfo.position. Is node info available?")
-            except Exception as e:
-                # Catch unexpected errors during GPS fetch
-                logger.error(f"Error getting GPS data: {e}")
-
-            try:
-                # Attempt to get battery level from node info
-                if self.interface and hasattr(self.interface, 'myInfo') and self.interface.myInfo:
-                    metrics = self.interface.myInfo.device_metrics
-                    if metrics and isinstance(metrics, dict) and 'batteryLevel' in metrics:
-                        battery_level = metrics['batteryLevel']
-
-                if battery_level is None:
-                     # Optional: Direct call fallback
-                     # battery_level = self.interface.localNode.getDeviceMetrics().batteryLevel
-                     logger.warning("Could not get battery level for emergency message.")
-
-            except AttributeError:
-                 logger.warning("Could not access interface.myInfo.device_metrics. Is node info available?")
-            except Exception as e:
-                logger.error(f"Error getting battery level: {e}")
+            battery_level = self._get_local_battery_level()
+            if battery_level is None:
+                logger.debug("Could not get battery level for emergency message.")
 
 
             # --- Construct and Send Payload ---
@@ -368,25 +415,12 @@ class AERP:
             logger.info(f"Sending emergency broadcast (ID: {current_emergency_id}) on port {port_num}")
             logger.debug(f"Emergency Payload: {message_payload}")
 
-            try:
-                # Send the data using the Meshtastic interface
-                self.interface.sendData(
-                    payload=message_payload,
-                    portNum=port_num,
-                    # wantAck=False # Default, ACKs are handled by the plugin logic
-                    # channelIndex=0 # Specify channel if needed
-                )
-            except TypeError as e:
-                 logger.error(f"TypeError sending EMERGENCY message: {e}")
-                 # Try sending as bytes
-                 try:
-                      self.interface.sendData(payload=json.dumps(message_payload).encode('utf-8'), portNum=port_num)
-                 except Exception as inner_e:
-                      logger.error(f"Retry sending EMERGENCY as bytes also failed: {inner_e}")
-            except AttributeError as e:
-                 logger.error(f"Meshtastic interface error sending EMERGENCY: {e}. Is it connected?")
-            except Exception as e:
-                logger.exception(f"Failed to send emergency broadcast: {e}")
+            self._send_aerp_payload(
+                message_payload,
+                port_num,
+                description="EMERGENCY message",
+                want_ack=False,
+            )
 
             # --- Wait for Interval ---
             # Check the active flag *again* immediately before sleeping
@@ -424,7 +458,7 @@ class AERP:
                 return
 
             decoded_part = packet['decoded']
-            port_num = decoded_part.get('portNum') # Can be int or string ('UNKNOWN_APP', 'TEXT_MESSAGE_APP', etc.)
+            port_num = decoded_part.get('portnum', decoded_part.get('portNum')) # Can be int or string ('PRIVATE_APP', 'TEXT_MESSAGE_APP', etc.)
             payload = decoded_part.get('payload') # Can be bytes, dict (if auto-decoded JSON), string etc.
             from_node_num = packet.get('from')
             to_node_num = packet.get('to') # Useful for checking if message was direct or broadcast
@@ -438,24 +472,13 @@ class AERP:
 
             # --- Attempt to Decode Payload if Bytes ---
             # Meshtastic library sometimes provides payload as bytes, try decoding as JSON
-            decoded_payload = None
-            if isinstance(payload, bytes):
-                try:
-                    decoded_payload = json.loads(payload.decode('utf-8'))
-                    logger.debug(f"Successfully decoded JSON payload from bytes from {from_node_id_fmt}")
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    # Not valid JSON or not UTF-8 text, treat as raw bytes or ignore
-                    logger.debug(f"Payload from {from_node_id_fmt} on port {port_num} is bytes but not valid JSON/UTF-8.")
-                    # We might still want to process based on portnum below, even if payload isn't JSON
-            elif isinstance(payload, dict):
-                 decoded_payload = payload # Already a dictionary
-            # Add handling for other payload types (like plain text) if needed
+            decoded_payload = self._decode_payload(payload, from_node_id_fmt, port_num)
 
             # --- Route based on Port Number and Message Type ---
             target_port = self.config.get(CONFIG_PORT)
 
             # 1. Check if it's on the AERP Port
-            if port_num == target_port:
+            if self._is_aerp_port(port_num):
                 if isinstance(decoded_payload, dict):
                     message_type = decoded_payload.get("type")
                     if message_type == MSG_TYPE_EMERGENCY:
@@ -605,33 +628,14 @@ class AERP:
         logger.info(f"Sending ACK to {dest_node_id_fmt} for Emergency ID {emergency_id} on port {port_num}")
         logger.debug(f"ACK Payload: {ack_payload}")
 
-        try:
-            # Send directly to the node that sent the emergency
-            # Format destination ID string correctly for sendData
-            destination_id_str = f"!{destination_node_num:08x}"
-
-            self.interface.sendData(
-                payload=ack_payload,
-                destinationId=destination_id_str,
-                portNum=port_num,
-                wantAck=False # ACKs usually don't need their own ACK (prevents ACK loops)
-            )
-        except TypeError as e:
-             logger.error(f"TypeError sending ACK message to {dest_node_id_fmt}: {e}")
-             # Try sending as bytes
-             try:
-                  self.interface.sendData(
-                       payload=json.dumps(ack_payload).encode('utf-8'),
-                       destinationId=destination_id_str,
-                       portNum=port_num,
-                       wantAck=False
-                  )
-             except Exception as inner_e:
-                  logger.error(f"Retry sending ACK as bytes also failed: {inner_e}")
-        except AttributeError as e:
-             logger.error(f"Meshtastic interface error sending ACK: {e}. Is it connected?")
-        except Exception as e:
-            logger.exception(f"Failed to send ACK to {dest_node_id_fmt}: {e}")
+        destination_id_str = f"!{destination_node_num:08x}"
+        self._send_aerp_payload(
+            ack_payload,
+            port_num,
+            description=f"ACK message to {dest_node_id_fmt}",
+            destination_id=destination_id_str,
+            want_ack=False,
+        )
 
 
     # --- Proximity Alert ---
@@ -653,29 +657,12 @@ class AERP:
         if alert_radius <= 0:
             return
 
-        my_lat, my_lon = None, None
-        try:
-            # Get my current position
-            if self.interface and hasattr(self.interface, 'myInfo') and self.interface.myInfo:
-                my_pos = self.interface.myInfo.position
-                if my_pos and isinstance(my_pos, dict):
-                    if 'latitudeI' in my_pos and 'longitudeI' in my_pos:
-                        my_lat = my_pos['latitudeI'] / 1e7
-                        my_lon = my_pos['longitudeI'] / 1e7
-                    elif 'latitude' in my_pos and 'longitude' in my_pos: # Fallback
-                        my_lat = my_pos['latitude']
-                        my_lon = my_pos['longitude']
-
-            if my_lat is None or my_lon is None:
-                logger.debug("Cannot check alert radius: My current location is unknown.")
-                return
-
-        except AttributeError:
-             logger.warning("Could not access my position (interface.myInfo.position) for alert check.")
-             return
-        except Exception as e:
-            logger.error(f"Could not get my own position for alert radius check: {e}")
-            return # Cannot check distance without own position
+        my_position = self._get_local_position_payload()
+        my_lat = my_position.get('latitude') if my_position else None
+        my_lon = my_position.get('longitude') if my_position else None
+        if my_lat is None or my_lon is None:
+            logger.debug("Cannot check alert radius: My current location is unknown.")
+            return
 
         # Calculate distance using the utility function
         distance = calculate_distance(my_lat, my_lon, lat, lon)

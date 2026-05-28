@@ -1,0 +1,8 @@
+{
+    "interval": 45,
+    "emergency_port": 300,
+    "emergency_message": "SAR ALERT: Team member requires assistance.",
+    "alert_radius": 1500,
+    "ack_timeout": 900,
+    "plugin_enabled_by_default": false
+}

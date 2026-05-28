@@ -28,6 +28,87 @@ from .constants import EARTH_RADIUS_METERS
 # Get a logger specific to this module
 logger = logging.getLogger(__name__)
 
+
+def extract_coordinates(location_data):
+    """
+    Normalize Meshtastic-style location dictionaries into decimal coordinates.
+
+    Args:
+        location_data (dict): A Meshtastic position dictionary.
+
+    Returns:
+        tuple: (latitude, longitude) as floats if available, otherwise (None, None).
+    """
+    if not isinstance(location_data, dict):
+        return None, None
+
+    if 'latitudeI' in location_data and 'longitudeI' in location_data:
+        try:
+            lat = float(location_data['latitudeI']) / 1e7
+            lon = float(location_data['longitudeI']) / 1e7
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
+        except (TypeError, ValueError):
+            return None, None
+
+    if 'latitude' in location_data and 'longitude' in location_data:
+        try:
+            lat = float(location_data['latitude'])
+            lon = float(location_data['longitude'])
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
+        except (TypeError, ValueError):
+            return None, None
+
+    return None, None
+
+
+def build_gps_payload(location_data):
+    """
+    Convert a Meshtastic position dictionary into the JSON payload used by AERP.
+
+    Args:
+        location_data (dict): A Meshtastic position dictionary.
+
+    Returns:
+        dict: Normalized GPS payload, or an empty dict if coordinates are unavailable.
+    """
+    lat, lon = extract_coordinates(location_data)
+    if lat is None or lon is None:
+        return {}
+
+    gps_payload = {
+        "latitude": lat,
+        "longitude": lon,
+    }
+    if isinstance(location_data, dict):
+        if location_data.get('altitude') is not None:
+            gps_payload['altitude'] = location_data['altitude']
+        if location_data.get('time') is not None:
+            gps_payload['time'] = location_data['time']
+
+    return gps_payload
+
+
+def extract_battery_level(metrics):
+    """
+    Extract battery level from Meshtastic device metrics dictionaries.
+
+    Args:
+        metrics (dict): The metrics dictionary from a node record.
+
+    Returns:
+        int | float | None: Battery percentage if available.
+    """
+    if not isinstance(metrics, dict):
+        return None
+
+    if metrics.get('batteryLevel') is not None:
+        return metrics.get('batteryLevel')
+    if metrics.get('battery_level') is not None:
+        return metrics.get('battery_level')
+    return None
+
 def calculate_distance(lat1, lon1, lat2, lon2):
     """
     Calculate the great-circle distance between two points
@@ -99,55 +180,21 @@ def get_location_from_packet(packet):
          return None, None
 
     payload = decoded_part.get('payload')
-    portnum = decoded_part.get('portNum') # Can be int or string depending on source
+    portnum = decoded_part.get('portnum', decoded_part.get('portNum')) # Can be int or string depending on source
 
     # --- Check Standard Position App Packet ---
     # meshtastic.util.PortNum.POSITION_APP == 1
     if portnum == 1 or str(portnum) == 'POSITION_APP':
-        if isinstance(payload, dict):
-            # Meshtastic position payloads use integer representations (degrees * 1e7)
-            if 'latitudeI' in payload and 'longitudeI' in payload:
-                try:
-                    lat = float(payload['latitudeI']) / 1e7
-                    lon = float(payload['longitudeI']) / 1e7
-                    # Basic validation for range
-                    if -90 <= lat <= 90 and -180 <= lon <= 180:
-                        return lat, lon
-                    else:
-                        logger.debug(f"Position packet coordinates out of range: lat={lat}, lon={lon}")
-                except (TypeError, ValueError) as e:
-                    logger.warning(f"Error converting position packet coordinates: {e}, payload: {payload}")
-            # Older versions might have used float directly? Less common now.
-            elif 'latitude' in payload and 'longitude' in payload:
-                 try:
-                     lat = float(payload['latitude'])
-                     lon = float(payload['longitude'])
-                     if -90 <= lat <= 90 and -180 <= lon <= 180:
-                         return lat, lon
-                 except (TypeError, ValueError):
-                     pass # Ignore if conversion fails
+        position_data = decoded_part.get('position', payload)
+        lat, lon = extract_coordinates(position_data)
+        if lat is not None and lon is not None:
+            return lat, lon
 
     # --- Check for Embedded 'gps' Dictionary (e.g., in AERP messages) ---
     if isinstance(payload, dict) and 'gps' in payload and isinstance(payload['gps'], dict):
-        gps_data = payload['gps']
-        # Prefer precise integer format if available
-        if 'latitudeI' in gps_data and 'longitudeI' in gps_data:
-            try:
-                lat = float(gps_data['latitudeI']) / 1e7
-                lon = float(gps_data['longitudeI']) / 1e7
-                if -90 <= lat <= 90 and -180 <= lon <= 180:
-                    return lat, lon
-            except (TypeError, ValueError):
-                pass # Ignore conversion errors
-        # Fallback to float format
-        elif 'latitude' in gps_data and 'longitude' in gps_data:
-            try:
-                lat = float(gps_data['latitude'])
-                lon = float(gps_data['longitude'])
-                if -90 <= lat <= 90 and -180 <= lon <= 180:
-                    return lat, lon
-            except (TypeError, ValueError):
-                 pass # Ignore conversion errors
+        lat, lon = extract_coordinates(payload['gps'])
+        if lat is not None and lon is not None:
+            return lat, lon
 
     # If no location found after checking both possibilities
     # logger.debug(f"Could not extract valid location from packet ID: {packet.get('id', 'N/A')}, Port: {portnum}")

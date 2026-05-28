@@ -33,6 +33,7 @@ import sys
 import os
 import json # For printing status nicely
 from datetime import datetime # For formatting status timestamps
+from typing import Optional
 
 # --- Logging Setup ---
 # Configure logging early, before importing other AERP modules that might log.
@@ -60,7 +61,7 @@ except ImportError as e:
 # This is necessary because the Meshtastic pubsub callbacks are simple functions
 # and need access to the running AERP instance.
 # A class-based CLI structure could avoid globals but adds complexity.
-aerp_instance: AERP | None = None
+aerp_instance: Optional[AERP] = None
 meshtastic_interface = None # Global reference to the interface for cleanup
 
 # --- Meshtastic Event Callbacks ---
@@ -85,9 +86,9 @@ def onReceive(packet, interface):
     else:
         logger.warning("CLI onReceive: Received packet but AERP instance is not initialized.")
 
-def onConnection(interface, connected):
+def _handle_connection_event(interface, connected):
     """
-    Callback wrapper for Meshtastic 'meshtastic.connection' pubsub events.
+    Common handler for Meshtastic connection pubsub events.
     Notifies the AERP instance about connection status changes.
 
     Args:
@@ -103,6 +104,16 @@ def onConnection(interface, connected):
             logger.exception(f"Error in AERP on_connection_change callback: {e}")
     else:
         logger.warning("CLI onConnection: Status changed but AERP instance is not initialized.")
+
+
+def onConnectionEstablished(interface):
+    """Handle Meshtastic connection-established pubsub events."""
+    _handle_connection_event(interface, True)
+
+
+def onConnectionLost(interface):
+    """Handle Meshtastic connection-lost pubsub events."""
+    _handle_connection_event(interface, False)
 
 # --- Meshtastic Interface Setup ---
 
@@ -341,7 +352,8 @@ def main():
     logger.info("Registering Meshtastic pubsub callbacks...")
     try:
         pub.subscribe(onReceive, "meshtastic.receive")
-        pub.subscribe(onConnection, "meshtastic.connection")
+        pub.subscribe(onConnectionEstablished, "meshtastic.connection.established")
+        pub.subscribe(onConnectionLost, "meshtastic.connection.lost")
         # Note: If using older meshtastic versions, these might be needed instead/as well:
         # interface.addReceiveCallback(onReceive)
         # interface.addConnectionCallback(onConnection)
