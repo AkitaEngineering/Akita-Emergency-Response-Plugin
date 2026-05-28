@@ -31,6 +31,7 @@ If you eventually need fully autonomous on-device alerting with no attached host
 - Python `>=3.9,<3.15` to match the current `meshtastic` package requirement
 - a Meshtastic radio connected over serial or reachable over TCP
 - dependencies from `requirements.txt`
+- (Optional) `customtkinter` for the Graphical Dashboard.
 
 ## Quick Start
 
@@ -86,6 +87,16 @@ python -m aerp.cli --device /dev/ttyUSB0 --config config/aerp_config.json --debu
 ```
 
 If the config file does not exist, AERP creates a default JSON config at the path passed to `--config`.
+
+## GUI Dashboard
+
+AERP includes a beautiful, fully-featured dark-mode graphical dashboard (`customtkinter` required). To launch it:
+
+```bash
+python -m aerp.gui --config config/aerp_config.json
+```
+
+The GUI allows you to explicitly connect to a radio, monitor logs precisely, track incoming incidents, and manage broadcasts visually using a high-contrast Red/Black/Gray interface.
 
 ## Connection Modes
 
