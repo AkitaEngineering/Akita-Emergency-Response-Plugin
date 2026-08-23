@@ -24,9 +24,6 @@ Constants used throughout the Akita Emergency Response Plugin (AERP).
 MSG_TYPE_EMERGENCY = "AERP_EMERGENCY" # Indicates an emergency broadcast
 MSG_TYPE_ACK = "AERP_ACK"             # Indicates an acknowledgement of an emergency message
 MSG_TYPE_CLEAR = "AERP_CLEAR"         # Indicates the emergency situation is resolved
-# Future enhancement ideas:
-# MSG_TYPE_STATUS_REQUEST = "AERP_STATUS_REQ" # Request status from another node
-# MSG_TYPE_STATUS_RESPONSE = "AERP_STATUS_RESP" # Response to a status request
 
 # --- Default Meshtastic Port ---
 # Port number used for AERP communication over Meshtastic.
@@ -44,6 +41,22 @@ DEFAULT_EMERGENCY_MESSAGE = "SOS! Emergency situation detected." # Default text 
 DEFAULT_ALERT_RADIUS = 1000         # Default proximity alert radius in meters (0 to disable)
 DEFAULT_ACK_TIMEOUT = 300           # Default time in seconds before an ACK is considered stale
 DEFAULT_ENABLED_BY_DEFAULT = False  # Default setting for auto-starting on launch
+
+# Meshtastic currently limits decoded data payloads to 233 bytes. AERP keeps
+# operator-provided text small enough that an emergency ID and GPS coordinates
+# still fit in one packet. `_send_aerp_payload` performs the final authoritative
+# encoded-size check before every transmission.
+MAX_MESHTASTIC_PAYLOAD_BYTES = 233
+MAX_EMERGENCY_MESSAGE_BYTES = 80
+
+# Bounds for data received from the mesh. These prevent a malformed peer from
+# growing memory/log output without limit while remaining backward compatible
+# with existing AERP UUIDs and operator messages.
+MAX_RECEIVED_MESSAGE_CHARS = 512
+MAX_EMERGENCY_ID_CHARS = 128
+MAX_NODE_NUM = 0xFFFFFFFF
+CLEAR_BROADCAST_REPETITIONS = 3
+CLEAR_BROADCAST_SPACING_SECONDS = 0.2
 
 # --- Configuration File Keys ---
 # These strings are the expected keys within the `aerp_config.json` file.

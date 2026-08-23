@@ -21,7 +21,6 @@ Includes distance calculation, location extraction, and formatting helpers.
 
 import math
 import logging
-import meshtastic.util # For POSITION_APP constant if needed, though direct check is fine
 
 from .constants import EARTH_RADIUS_METERS
 
@@ -46,7 +45,7 @@ def extract_coordinates(location_data):
         try:
             lat = float(location_data['latitudeI']) / 1e7
             lon = float(location_data['longitudeI']) / 1e7
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
+            if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
                 return lat, lon
         except (TypeError, ValueError):
             return None, None
@@ -55,7 +54,7 @@ def extract_coordinates(location_data):
         try:
             lat = float(location_data['latitude'])
             lon = float(location_data['longitude'])
-            if -90 <= lat <= 90 and -180 <= lon <= 180:
+            if math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
                 return lat, lon
         except (TypeError, ValueError):
             return None, None
@@ -82,10 +81,22 @@ def build_gps_payload(location_data):
         "longitude": lon,
     }
     if isinstance(location_data, dict):
-        if location_data.get('altitude') is not None:
-            gps_payload['altitude'] = location_data['altitude']
-        if location_data.get('time') is not None:
-            gps_payload['time'] = location_data['time']
+        altitude = location_data.get('altitude')
+        if (
+            isinstance(altitude, (int, float))
+            and not isinstance(altitude, bool)
+            and math.isfinite(altitude)
+        ):
+            gps_payload['altitude'] = altitude
+
+        position_time = location_data.get('time')
+        if (
+            isinstance(position_time, (int, float))
+            and not isinstance(position_time, bool)
+            and math.isfinite(position_time)
+            and position_time >= 0
+        ):
+            gps_payload['time'] = position_time
 
     return gps_payload
 
@@ -103,10 +114,16 @@ def extract_battery_level(metrics):
     if not isinstance(metrics, dict):
         return None
 
-    if metrics.get('batteryLevel') is not None:
-        return metrics.get('batteryLevel')
-    if metrics.get('battery_level') is not None:
-        return metrics.get('battery_level')
+    value = metrics.get('batteryLevel')
+    if value is None:
+        value = metrics.get('battery_level')
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0 <= value <= 101
+    ):
+        return value
     return None
 
 def calculate_distance(lat1, lon1, lat2, lon2):
@@ -128,7 +145,12 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     if None in [lat1, lon1, lat2, lon2]:
         logger.debug("Cannot calculate distance with missing GPS coordinates.")
         return float('inf')
-    if not all(isinstance(coord, (int, float)) for coord in [lat1, lon1, lat2, lon2]):
+    if not all(
+        isinstance(coord, (int, float))
+        and not isinstance(coord, bool)
+        and math.isfinite(coord)
+        for coord in [lat1, lon1, lat2, lon2]
+    ):
          logger.warning(f"Invalid coordinate types for distance calculation: {lat1}, {lon1}, {lat2}, {lon2}")
          return float('inf')
     if not (-90 <= lat1 <= 90 and -90 <= lat2 <= 90 and -180 <= lon1 <= 180 and -180 <= lon2 <= 180):
@@ -143,6 +165,8 @@ def calculate_distance(lat1, lon1, lat2, lon2):
         dlon = rad_lon2 - rad_lon1
         dlat = rad_lat2 - rad_lat1
         a = math.sin(dlat / 2)**2 + math.cos(rad_lat1) * math.cos(rad_lat2) * math.sin(dlon / 2)**2
+        # Protect against tiny floating-point excursions outside [0, 1].
+        a = min(1.0, max(0.0, a))
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
         distance = EARTH_RADIUS_METERS * c
@@ -196,8 +220,6 @@ def get_location_from_packet(packet):
         if lat is not None and lon is not None:
             return lat, lon
 
-    # If no location found after checking both possibilities
-    # logger.debug(f"Could not extract valid location from packet ID: {packet.get('id', 'N/A')}, Port: {portnum}")
     return None, None
 
 def format_node_id(node_num):
@@ -216,8 +238,10 @@ def format_node_id(node_num):
         return "Unknown"
     try:
         # Ensure it's treated as an integer, then format as 8-digit hex
-        return f"!{int(node_num):08x}"
+        normalized = int(node_num)
+        if isinstance(node_num, bool) or not 0 <= normalized <= 0xFFFFFFFF:
+            raise ValueError("node number is outside the uint32 range")
+        return f"!{normalized:08x}"
     except (ValueError, TypeError):
         logger.warning(f"Could not format invalid node number: {node_num}")
         return "Unknown"
-

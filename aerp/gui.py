@@ -3,26 +3,22 @@
 
 """
 Graphical User Interface for the Akita Emergency Response Plugin (AERP).
-Provides a beautiful, dark-themed dashboard using CustomTkinter.
-Palette requested: Black, White, Gray, Red.
+Provides a dark-themed dashboard using CustomTkinter.
 """
 
-import sys
 import threading
 import queue
 import logging
+import re
 import customtkinter as ctk
-import meshtastic
 import meshtastic.serial_interface
 import meshtastic.tcp_interface
 from pubsub import pub
-from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .plugin import AERP
 from .config import ConfigManager
-from .constants import CONFIG_PORT, CONFIG_INTERVAL
-from .utils import format_node_id
+from .constants import CONFIG_ENABLED, CONFIG_PORT, CONFIG_INTERVAL
 
 # Configure the fundamental palette
 ctk.set_appearance_mode("dark")
@@ -46,8 +42,11 @@ class UIQueueHandler(logging.Handler):
         self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
     def emit(self, record):
-        msg = self.format(record)
-        self.log_queue.put({"type": "log", "message": msg})
+        try:
+            msg = self.format(record)
+            self.log_queue.put_nowait({"type": "log", "message": msg})
+        except Exception:
+            self.handleError(record)
 
 
 class AERPApp(ctk.CTk):
@@ -58,15 +57,18 @@ class AERPApp(ctk.CTk):
         
         # State
         self.aerp_instance: Optional[AERP] = None
-        self.meshtastic_interface = None
-        self.ui_queue = queue.Queue()
-        self.connection_thread = None
+        self.meshtastic_interface: Any = None
+        self.ui_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=10_000)
+        self.connection_thread: Optional[threading.Thread] = None
+        self.log_handler: Optional[UIQueueHandler] = None
+        self._closing = False
         
         # Setup Window
         self.title("AERP - Tactical Response Dashboard")
         self.geometry("1100x700")
         self.minsize(900, 600)
         self.configure(fg_color=BG_BLACK)
+        self.protocol("WM_DELETE_WINDOW", self.handle_close)
         
         # Layout
         self.grid_rowconfigure(0, weight=1)
@@ -91,9 +93,9 @@ class AERPApp(ctk.CTk):
         self.sidebar.grid_rowconfigure(5, weight=1) # Push logs to bottom
         
         # Brand Header
-        self.brand_lbl = ctk.CTkLabel(self.sidebar, text="A T R P", font=ctk.CTkFont(size=28, weight="bold"), text_color=ACCENT_RED)
+        self.brand_lbl = ctk.CTkLabel(self.sidebar, text="A E R P", font=ctk.CTkFont(size=28, weight="bold"), text_color=ACCENT_RED)
         self.brand_lbl.grid(row=0, column=0, padx=20, pady=(20, 0), sticky="w")
-        self.sub_brand_lbl = ctk.CTkLabel(self.sidebar, text="Akita Tactical Response", font=ctk.CTkFont(size=12), text_color=TEXT_GRAY)
+        self.sub_brand_lbl = ctk.CTkLabel(self.sidebar, text="Akita Emergency Response", font=ctk.CTkFont(size=12), text_color=TEXT_GRAY)
         self.sub_brand_lbl.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="w")
         
         # Connection Controls
@@ -185,6 +187,8 @@ class AERPApp(ctk.CTk):
     # --- Actions ---
     
     def handle_connect(self):
+        if self.connection_thread and self.connection_thread.is_alive():
+            return
         self.btn_connect.configure(state="disabled", text="CONNECTING...")
         target = self.entry_device.get().strip()
         
@@ -195,18 +199,53 @@ class AERPApp(ctk.CTk):
     def _bg_connect(self, target):
         self.ui_queue.put({"type": "log", "message": f"Establishing connection to {target if target else 'auto-detect'}..."})
         try:
-            if target and ("." in target or target.lower() == "localhost"):
-                interface = meshtastic.tcp_interface.TCPInterface(hostname=target)
-            elif target:
+            old_plugin = self.aerp_instance
+            old_interface = self.meshtastic_interface
+            self.aerp_instance = None
+            self.meshtastic_interface = None
+            if old_plugin:
+                old_plugin.close(send_clear=True)
+            if old_interface:
+                try:
+                    old_interface.close()
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "Previous interface reported an error while closing.",
+                        exc_info=True,
+                    )
+
+            if target.lower().startswith("tcp://"):
+                hostname = target[6:].strip()
+                if not hostname:
+                    raise ValueError("tcp:// must be followed by a hostname or IP address")
+                interface = meshtastic.tcp_interface.TCPInterface(hostname=hostname)
+            elif target.lower().startswith("serial://"):
+                device_path = target[9:].strip()
+                if not device_path:
+                    raise ValueError("serial:// must be followed by a device path")
+                interface = meshtastic.serial_interface.SerialInterface(devPath=device_path)
+            elif target and (target.startswith(("/", "\\\\")) or re.fullmatch(r"COM\d+", target, re.IGNORECASE)):
                 interface = meshtastic.serial_interface.SerialInterface(devPath=target)
+            elif target:
+                interface = meshtastic.tcp_interface.TCPInterface(hostname=target)
             else:
                 interface = meshtastic.serial_interface.SerialInterface()
                 
             self.meshtastic_interface = interface
             self.aerp_instance = AERP(self.meshtastic_interface, self.config)
-            
+
+            if self.config.get(CONFIG_ENABLED, False):
+                if not self.aerp_instance.start_emergency():
+                    self.ui_queue.put({"type": "log", "message": "Configured auto-start failed; see the log for details."})
             self.ui_queue.put({"type": "connection_success"})
         except Exception as e:
+            if self.meshtastic_interface:
+                try:
+                    self.meshtastic_interface.close()
+                except Exception:
+                    logging.getLogger(__name__).debug("Failed to close interface after connection error.", exc_info=True)
+            self.meshtastic_interface = None
+            self.aerp_instance = None
             self.ui_queue.put({"type": "log", "message": f"Connection failed: {e}"})
             self.ui_queue.put({"type": "connection_failed"})
 
@@ -222,10 +261,10 @@ class AERPApp(ctk.CTk):
         if self.aerp_instance:
             if self.aerp_instance.emergency_active:
                 self.aerp_instance.stop_emergency(send_clear=True)
-                self.ui_queue.put({"type": "log", "message": "ALL-CLEAR SENT & BROADCAST STOPPED"})
+                self.ui_queue.put({"type": "log", "message": "BROADCAST STOPPED; ALL-CLEAR TRANSMISSION ATTEMPTED"})
             elif self.aerp_instance.last_sent_emergency_id:
-                self.aerp_instance.send_clear_message(self.aerp_instance.last_sent_emergency_id)
-                self.ui_queue.put({"type": "log", "message": "ALL-CLEAR SENT (No active broadcast)"})
+                if self.aerp_instance.send_clear_message(self.aerp_instance.last_sent_emergency_id):
+                    self.ui_queue.put({"type": "log", "message": "ALL-CLEAR QUEUED (No active broadcast)"})
             self.btn_start.configure(fg_color=ACCENT_RED, border_width=0)
         else:
             self.ui_queue.put({"type": "log", "message": "Cannot stop: Not connected to radio."})
@@ -234,19 +273,19 @@ class AERPApp(ctk.CTk):
     
     def on_receive(self, packet, interface):
         # We bounce the packet to AERP on the mesh thread, then fetch state changes to UI
-        if self.aerp_instance:
+        if self.aerp_instance and interface is self.meshtastic_interface:
             self.aerp_instance.handle_incoming(packet, interface)
             self.ui_queue.put({"type": "sync_status"})
             
     def on_connection_est(self, interface):
-        if self.aerp_instance:
+        if self.aerp_instance and interface is self.meshtastic_interface:
             self.aerp_instance.on_connection_change(interface, True)
             self.ui_queue.put({"type": "sync_status"})
 
     def on_connection_lost(self, interface):
-        if self.aerp_instance:
+        if self.aerp_instance and interface is self.meshtastic_interface:
             self.aerp_instance.on_connection_change(interface, False)
-            self.ui_queue.put({"type": "sync_status"})
+            self.ui_queue.put({"type": "connection_lost"})
 
     def process_queue(self):
         """Called repeatedly by Tkinter's mainloop to process threads safely."""
@@ -264,12 +303,17 @@ class AERPApp(ctk.CTk):
                 elif rtype == "connection_success":
                     self.btn_connect.configure(state="normal", text="CONNECTED", fg_color="green")
                     self.lbl_state.configure(text="State: Connected", text_color="green")
-                    if self.aerp_instance and self.aerp_instance.my_node_id:
+                    if self.aerp_instance and self.aerp_instance.my_node_id != "Unknown":
                         self.lbl_node_id.configure(text=f"Node: {self.aerp_instance.my_node_id}", text_color=TEXT_WHITE)
                         
                 elif rtype == "connection_failed":
                     self.btn_connect.configure(state="normal", text="CONNECT RADIO", fg_color=BG_GRAY_LIGHT)
                     self.lbl_state.configure(text="State: Disconnected", text_color="red")
+
+                elif rtype == "connection_lost":
+                    self.btn_connect.configure(state="normal", text="RECONNECT", fg_color=BG_GRAY_LIGHT)
+                    self.lbl_state.configure(text="State: Disconnected", text_color="red")
+                    self.lbl_node_id.configure(text="Node: Unknown", text_color=TEXT_GRAY)
                     
                 elif rtype == "sync_status":
                     self._sync_ui_with_aerp()
@@ -285,13 +329,18 @@ class AERPApp(ctk.CTk):
             if self.aerp_instance:
                 self._sync_ui_with_aerp()
                 
-        self.after(100, self.process_queue)
+        if not self._closing:
+            self.after(100, self.process_queue)
 
     def _sync_ui_with_aerp(self):
         """Update UI to match AERP internal dictionary state."""
         if not self.aerp_instance: return
         
         status = self.aerp_instance.get_status()
+        if status.get("emergency_active"):
+            self.lbl_state.configure(text="State: EMERGENCY ACTIVE", text_color=ACCENT_RED)
+        elif self.aerp_instance.my_node_num is not None:
+            self.lbl_state.configure(text="State: Connected", text_color="green")
         
         # Node ID
         if status.get("my_node_id") and self.lbl_node_id.cget("text") == "Node: Unknown":
@@ -301,7 +350,11 @@ class AERPApp(ctk.CTk):
         emergencies = status.get("active_received_emergencies", {})
         
         # Remove old incidents
-        to_remove = [nid for nid in self.incident_widgets if nid not in emergencies]
+        to_remove = [
+            nid
+            for nid in self.incident_widgets
+            if nid != "empty_lbl" and nid not in emergencies
+        ]
         for nid in to_remove:
             self.incident_widgets[nid].destroy()
             del self.incident_widgets[nid]
@@ -309,13 +362,15 @@ class AERPApp(ctk.CTk):
         # Update or create new incidents
         for node_id, info in emergencies.items():
             msg = info.get('message', 'No Message')
-            gps = info.get('gps', {})
-            lat = gps.get('latitude', 0)
-            lon = gps.get('longitude', 0)
-            batt = info.get('battery', 'N/A')
+            gps = info.get('gps') or {}
+            lat = gps.get('latitude')
+            lon = gps.get('longitude')
+            position = f"{lat:.5f}, {lon:.5f}" if lat is not None and lon is not None else "Not available"
+            batt = info.get('battery')
+            battery = f"{batt}%" if batt is not None else "N/A"
             seen = info.get('last_seen', 'Unknown')
             
-            card_text = f"NODE: {node_id}\nLST SEEN: {seen} | BATT: {batt}%\nPOS: {lat:.5f}, {lon:.5f}\nMSG: {msg}"
+            card_text = f"NODE: {node_id}\nLST SEEN: {seen} | BATT: {battery}\nPOS: {position}\nMSG: {msg}"
             
             if node_id not in self.incident_widgets:
                 card = ctk.CTkFrame(self.incidents_scroll, fg_color=ACCENT_RED, corner_radius=6)
@@ -349,6 +404,33 @@ class AERPApp(ctk.CTk):
                 self.acks_txt.insert("end", f"[{timestamp}] Node {node_id}\n")
         self.acks_txt.configure(state="disabled")
 
+    def handle_close(self):
+        """Release subscriptions, workers, and the radio before closing."""
+        if self._closing:
+            return
+        self._closing = True
+        for callback, topic in (
+            (self.on_receive, "meshtastic.receive"),
+            (self.on_connection_est, "meshtastic.connection.established"),
+            (self.on_connection_lost, "meshtastic.connection.lost"),
+        ):
+            try:
+                pub.unsubscribe(callback, topic)
+            except Exception:
+                logging.getLogger(__name__).debug("GUI callback was already unsubscribed.")
+        if self.aerp_instance:
+            self.aerp_instance.close(send_clear=True)
+            self.aerp_instance = None
+        if self.meshtastic_interface:
+            try:
+                self.meshtastic_interface.close()
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to close the Meshtastic interface.")
+            self.meshtastic_interface = None
+        if self.log_handler:
+            logging.getLogger().removeHandler(self.log_handler)
+        self.destroy()
+
 def main():
     # Provide a CLI argument to specify config path just like the cli.py
     import argparse
@@ -371,10 +453,14 @@ def main():
     # Send logs to UI
     qh = UIQueueHandler(app.ui_queue)
     logging.getLogger().addHandler(qh)
+    app.log_handler = qh
     app.ui_queue.put({"type": "log", "message": "AERP Dashboard Initialized. Please connect your radio."})
     
-    # Block in Tkinter mainloop
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        if not app._closing:
+            app.handle_close()
 
 if __name__ == "__main__":
     main()

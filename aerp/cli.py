@@ -22,7 +22,6 @@ and manage the plugin's operation. Connects to a Meshtastic device and
 handles network events.
 """
 
-import meshtastic
 import meshtastic.serial_interface # Import specific interface type
 import meshtastic.tcp_interface   # Import TCP interface type
 from pubsub import pub # For subscribing to Meshtastic events
@@ -30,10 +29,7 @@ import time
 import logging
 import argparse
 import sys
-import os
-import json # For printing status nicely
-from datetime import datetime # For formatting status timestamps
-from typing import Optional
+from typing import Any, Optional
 
 # --- Logging Setup ---
 # Configure logging early, before importing other AERP modules that might log.
@@ -49,7 +45,6 @@ try:
     from .plugin import AERP
     from .config import ConfigManager
     from .constants import CONFIG_ENABLED, CONFIG_PORT, CONFIG_INTERVAL
-    from .utils import format_node_id
 except ImportError as e:
      # Handle cases where the script might be run directly without proper installation
      logger.exception(f"ImportError: Failed to import AERP modules. Ensure the package structure is correct or run using 'python -m aerp.cli'. Error: {e}")
@@ -62,7 +57,7 @@ except ImportError as e:
 # and need access to the running AERP instance.
 # A class-based CLI structure could avoid globals but adds complexity.
 aerp_instance: Optional[AERP] = None
-meshtastic_interface = None # Global reference to the interface for cleanup
+meshtastic_interface: Any = None # Global reference to the interface for cleanup
 
 # --- Meshtastic Event Callbacks ---
 
@@ -76,7 +71,6 @@ def onReceive(packet, interface):
         interface: The Meshtastic interface instance that received the packet.
                    (Passed by pubsub, may not always be needed if using global).
     """
-    # logger.debug(f"CLI onReceive: Packet received: {packet}") # Very verbose
     if aerp_instance:
         try:
             aerp_instance.handle_incoming(packet, interface)
@@ -149,30 +143,27 @@ def setup_meshtastic_interface(device_path=None, host=None, no_serial=False):
         try:
             if device_path:
                 logger.info(f"Using specified serial device: {device_path}")
-                meshtastic_interface = meshtastic.serial_interface.SerialInterface(devPath=device_path, debugOut=sys.stderr if logger.level == logging.DEBUG else None)
+                meshtastic_interface = meshtastic.serial_interface.SerialInterface(devPath=device_path, debugOut=sys.stderr if logger.isEnabledFor(logging.DEBUG) else None)
             else:
                 logger.info("Auto-detecting serial device...")
-                meshtastic_interface = meshtastic.serial_interface.SerialInterface(debugOut=sys.stderr if logger.level == logging.DEBUG else None)
+                meshtastic_interface = meshtastic.serial_interface.SerialInterface(debugOut=sys.stderr if logger.isEnabledFor(logging.DEBUG) else None)
 
-            # Wait briefly for the connection to establish and node info to potentially populate
+            # Allow the interface's receive thread a bounded period to populate
+            # local node information.
             logger.info("Waiting for node information...")
-            time.sleep(3) # Adjust as needed
-            if not meshtastic_interface.myInfo:
+            deadline = time.monotonic() + 5
+            while not getattr(meshtastic_interface, "myInfo", None) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if not getattr(meshtastic_interface, "myInfo", None):
                  logger.warning("Connected via serial, but node information not yet available. Plugin might need manual start.")
             else:
                  logger.info(f"Serial connection established. My Node Info: {meshtastic_interface.myInfo.my_node_num:#010x}")
 
             return meshtastic_interface
-        except meshtastic.MeshtasticError as e:
-            logger.error(f"Meshtastic serial connection error: {e}")
-            logger.error("Ensure device is connected, powered on, and drivers are installed.")
-            logger.error("Common paths: /dev/ttyUSB0, /dev/ttyACM0 (Linux), COM3, COM4 (Windows).")
-            logger.error("Try specifying the path with --device /path/to/device")
-            return None # Indicate failure
         except Exception as e:
-            # Catch other unexpected errors during serial connection
-            logger.exception(f"Unexpected error connecting via serial: {e}")
-            return None # Indicate failure
+            logger.error(f"Failed to connect via serial: {e}")
+            logger.error("Ensure the device is powered on and specify its path with --device if auto-detection fails.")
+            return None
 
 # --- CLI Command Handling ---
 
@@ -207,14 +198,12 @@ def print_status(status_dict):
             print(f"        Msg: '{info.get('message', '')}'")
             print(f"        GPS: {gps_str}")
             print(f"        Battery: {batt_str}")
+            print(f"        Sent At: {info.get('sent_at', 'Unknown')}")
             print(f"        Received At: {info.get('received_at', 'N/A')}")
             print(f"        Last Seen: {info.get('last_seen', 'N/A')}")
     else:
         print("    (None)")
 
-    # Optionally print config - can be verbose
-    # print("  Current Configuration:")
-    # print(json.dumps(status_dict.get('config', {}), indent=4))
     print("-------------------\n")
 
 
@@ -237,15 +226,13 @@ def run_cli_loop():
                 if aerp_instance:
                     if aerp_instance.start_emergency():
                          print("Emergency broadcast started.")
-                    # else: # start_emergency logs warnings/errors
                 else:
                     logger.error("AERP instance not ready.")
 
             elif user_input == "stop":
                 if aerp_instance:
                     if aerp_instance.stop_emergency(send_clear=True):
-                         print("Emergency broadcast stopped. 'All Clear' sent.")
-                    # else: # stop_emergency logs info if not active
+                         print("Emergency broadcast stopped. An 'All Clear' transmission was attempted; check the log for delivery errors.")
                 else:
                     logger.error("AERP instance not ready.")
 
@@ -254,8 +241,8 @@ def run_cli_loop():
                     if aerp_instance.emergency_active:
                         logger.warning("Emergency is currently active. Use 'stop' to stop and send clear.")
                     elif aerp_instance.last_sent_emergency_id:
-                        aerp_instance.send_clear_message(aerp_instance.last_sent_emergency_id)
-                        print(f"All Clear sent for last emergency ID {aerp_instance.last_sent_emergency_id}.")
+                        if aerp_instance.send_clear_message(aerp_instance.last_sent_emergency_id):
+                            print(f"All Clear queued for last emergency ID {aerp_instance.last_sent_emergency_id}.")
                     else:
                         logger.info("No previous emergency ID recorded to clear.")
                 else:
@@ -293,8 +280,6 @@ def run_cli_loop():
             break
         except Exception as e:
              logger.exception(f"An unexpected error occurred in the CLI loop: {e}")
-             # Optionally continue or break based on severity
-             # break
 
 # --- Main Execution ---
 
@@ -306,15 +291,17 @@ def main():
         description="Akita Emergency Response Plugin (AERP) for Meshtastic.",
         epilog="Example: python -m aerp.cli --device /dev/ttyUSB0 --debug"
     )
-    # Connection arguments (mutually exclusive conceptually, though not enforced by argparse group here)
-    parser.add_argument("--device", default=None, help="Specify the Meshtastic serial device path (e.g., /dev/ttyUSB0, COM3).")
-    parser.add_argument("--host", default=None, help="Specify hostname or IP for TCP connection.")
+    connection_group = parser.add_mutually_exclusive_group()
+    connection_group.add_argument("--device", default=None, help="Specify the Meshtastic serial device path (e.g., /dev/ttyUSB0, COM3).")
+    connection_group.add_argument("--host", default=None, help="Specify hostname or IP for TCP connection.")
     parser.add_argument("--no-serial", action="store_true", help="Disable serial connection attempt (use with --host or if no device expected).")
 
     # Configuration and Logging
     parser.add_argument("--config", default="config/aerp_config.json", help="Path to the AERP JSON configuration file.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for detailed output.")
     args = parser.parse_args()
+    if args.no_serial and not args.host:
+        parser.error("--no-serial requires --host; otherwise no connection method is available")
 
     # --- Configure Logging Level ---
     if args.debug:
@@ -322,8 +309,6 @@ def main():
         # Ensure all handlers also respect the level
         for handler in logging.getLogger().handlers:
             handler.setLevel(logging.DEBUG)
-            # Optionally re-apply formatter if needed, basicConfig usually handles it
-            # handler.setFormatter(logging.Formatter(log_format))
         logger.info("Debug logging enabled.")
     else:
          logging.getLogger().setLevel(logging.INFO)
@@ -354,13 +339,10 @@ def main():
         pub.subscribe(onReceive, "meshtastic.receive")
         pub.subscribe(onConnectionEstablished, "meshtastic.connection.established")
         pub.subscribe(onConnectionLost, "meshtastic.connection.lost")
-        # Note: If using older meshtastic versions, these might be needed instead/as well:
-        # interface.addReceiveCallback(onReceive)
-        # interface.addConnectionCallback(onConnection)
         logger.debug("Callbacks registered.")
     except Exception as e:
          logger.exception(f"Error subscribing to Meshtastic pubsub topics: {e}")
-         # Decide if this is fatal or if the app can proceed without event handling
+         aerp_instance.close(send_clear=False)
          interface.close()
          sys.exit(1)
 
@@ -368,9 +350,7 @@ def main():
     # --- Auto-Start Check ---
     if config_manager.get(CONFIG_ENABLED, False):
         logger.info("Configuration enables auto-start. Attempting to start emergency broadcast...")
-        # Need to wait briefly for node info to potentially populate *after* connection and AERP init
-        time.sleep(2) # Adjust as needed
-        if aerp_instance and aerp_instance.my_node_num:
+        if aerp_instance and aerp_instance.my_node_num is not None:
              aerp_instance.start_emergency()
         elif aerp_instance:
              logger.error("Auto-start failed: Node info not available yet. Start manually using 'start' command.")
@@ -385,9 +365,18 @@ def main():
         # --- Cleanup ---
         logger.info("Shutting down AERP...")
         if aerp_instance:
-            logger.debug("Stopping emergency broadcast (if active)...")
-            # Stop without sending clear, as we are exiting anyway
-            aerp_instance.stop_emergency(send_clear=False)
+            logger.debug("Stopping AERP workers (and sending ALL CLEAR if active)...")
+            aerp_instance.close(send_clear=True)
+
+        for callback, topic in (
+            (onReceive, "meshtastic.receive"),
+            (onConnectionEstablished, "meshtastic.connection.established"),
+            (onConnectionLost, "meshtastic.connection.lost"),
+        ):
+            try:
+                pub.unsubscribe(callback, topic)
+            except Exception:
+                logger.debug(f"Callback was not subscribed to {topic} during shutdown.")
 
         # Close the Meshtastic interface gracefully
         if meshtastic_interface: # Use the global reference

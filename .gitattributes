@@ -1,0 +1,2 @@
+*.py whitespace=cr-at-eol
+*.md whitespace=cr-at-eol

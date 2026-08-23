@@ -22,11 +22,12 @@ Handles loading, validation, and accessing configuration settings from a JSON fi
 import json
 import logging
 import os
+import tempfile
 from .constants import (
     DEFAULT_INTERVAL, DEFAULT_EMERGENCY_PORT, DEFAULT_EMERGENCY_MESSAGE,
     DEFAULT_ALERT_RADIUS, DEFAULT_ACK_TIMEOUT, DEFAULT_ENABLED_BY_DEFAULT,
     CONFIG_INTERVAL, CONFIG_PORT, CONFIG_MESSAGE, CONFIG_RADIUS,
-    CONFIG_ACK_TIMEOUT, CONFIG_ENABLED
+    CONFIG_ACK_TIMEOUT, CONFIG_ENABLED, MAX_EMERGENCY_MESSAGE_BYTES
 )
 
 # Get a logger specific to this module
@@ -94,30 +95,44 @@ class ConfigManager:
                 expected_type = type(default_value)
 
                 # Check type consistency
-                if isinstance(value, expected_type):
+                # bool is a subclass of int in Python; accepting true as an
+                # interval or port would silently produce an unsafe config.
+                if type(value) is expected_type:
                     # Perform value-specific validation
                     valid = True
                     error_msg = ""
                     if key == CONFIG_INTERVAL and value <= 0:
                         valid = False
                         error_msg = f"'{key}' must be a positive integer."
-                    elif key == CONFIG_PORT and not (0 <= value <= 511):
+                    elif key == CONFIG_PORT and not (256 <= value <= 511):
                         valid = False
-                        error_msg = f"'{key}' must be an integer between 0 and 511 (inclusive)."
+                        error_msg = f"'{key}' must be a private application port between 256 and 511."
                     elif key == CONFIG_RADIUS and value < 0:
                          valid = False
                          error_msg = f"'{key}' (alert radius) cannot be negative (use 0 to disable)."
                     elif key == CONFIG_ACK_TIMEOUT and value <= 0:
                         valid = False
                         error_msg = f"'{key}' must be a positive integer."
-                    elif key == CONFIG_MESSAGE and not value: # Check for empty string
+                    elif key == CONFIG_MESSAGE and not value.strip():
                          valid = False
-                         error_msg = f"'{key}' cannot be an empty string."
+                         error_msg = f"'{key}' cannot be empty or whitespace-only."
+                    elif key == CONFIG_MESSAGE and not value.isprintable():
+                         valid = False
+                         error_msg = f"'{key}' cannot contain control characters."
+                    elif key == CONFIG_MESSAGE and self._encoded_message_size(value) > MAX_EMERGENCY_MESSAGE_BYTES:
+                         valid = False
+                         error_msg = (
+                             f"'{key}' is too large for a single Meshtastic packet "
+                             f"(maximum encoded size: {MAX_EMERGENCY_MESSAGE_BYTES} bytes)."
+                         )
 
                     if valid:
                         validated_config[key] = value # Assign the valid value from the file
                     else:
-                        validation_errors.append(f"Invalid value for '{key}': {value}. {error_msg} Using default: {default_value}.")
+                        validation_errors.append(
+                            f"Invalid value for '{key}': {value!r}. {error_msg} "
+                            f"Using default: {default_value!r}."
+                        )
                         # Default value remains in validated_config
 
                 else: # Type mismatch
@@ -134,6 +149,35 @@ class ConfigManager:
                 logger.warning(f" - {error}")
 
         return validated_config
+
+    @staticmethod
+    def _encoded_message_size(value):
+        """Return the message's size as it appears inside AERP JSON."""
+        encoded = json.dumps(value, ensure_ascii=True).encode("utf-8")
+        return max(0, len(encoded) - 2)  # Exclude the surrounding JSON quotes.
+
+    def _write_default_config(self):
+        """Atomically create the default config without leaving partial JSON."""
+        config_dir = os.path.dirname(os.path.abspath(self.config_file))
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".aerp-config-",
+            suffix=".tmp",
+            dir=config_dir,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as config_handle:
+                json.dump(self._get_default_config(), config_handle, indent=4)
+                config_handle.write("\n")
+                config_handle.flush()
+                os.fsync(config_handle.fileno())
+            os.replace(temporary_path, self.config_file)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except OSError as cleanup_error:
+                logger.debug(f"Could not remove temporary config '{temporary_path}': {cleanup_error}")
+            raise
 
     def load_config(self):
         """
@@ -160,8 +204,7 @@ class ConfigManager:
             logger.warning(f"Configuration file '{self.config_file}' not found.")
             try:
                 logger.info(f"Creating default configuration file at '{self.config_file}'.")
-                with open(self.config_file, "w") as f:
-                    json.dump(self._get_default_config(), f, indent=4)
+                self._write_default_config()
                 self.config = self._get_default_config() # Use defaults after creating the file
             except IOError as e:
                 logger.error(f"Failed to create default configuration file '{self.config_file}': {e}. Using default values.")
@@ -170,7 +213,7 @@ class ConfigManager:
 
         # File exists, try to load and validate it
         try:
-            with open(self.config_file, "r") as f:
+            with open(self.config_file, "r", encoding="utf-8") as f:
                 loaded_config = json.load(f)
                 self.config = self._validate_config(loaded_config)
                 logger.info(f"Successfully loaded and validated configuration from '{self.config_file}'")
@@ -220,4 +263,3 @@ class ConfigManager:
         Returns a string representation of the current configuration.
         """
         return json.dumps(self.config, indent=4)
-

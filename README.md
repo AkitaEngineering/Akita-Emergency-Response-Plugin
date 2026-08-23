@@ -9,9 +9,11 @@ Website: https://www.akitaengineering.com
 ## Current Status
 
 - Emergency, ACK, and CLEAR messages are sent as JSON bytes using the current Meshtastic Python API.
+- Emergency payloads are size-checked against Meshtastic's 233-byte limit before transmission.
 - Incoming alerts work with both raw private-port numbers and Meshtastic's `PRIVATE_APP` alias.
 - Proximity alerts recognize standard Meshtastic `decoded.position` packets.
 - Local GPS and battery telemetry are read from Meshtastic's node database when available.
+- Worker threads stop promptly, and graceful CLI/GUI shutdown attempts an all-clear for an active local incident.
 
 ## Why This Is Not an ESP-IDF Port
 
@@ -31,7 +33,7 @@ If you eventually need fully autonomous on-device alerting with no attached host
 - Python `>=3.9,<3.15` to match the current `meshtastic` package requirement
 - a Meshtastic radio connected over serial or reachable over TCP
 - dependencies from `requirements.txt`
-- (Optional) `customtkinter` for the Graphical Dashboard.
+- (Optional) `customtkinter` for the graphical dashboard.
 
 ## Quick Start
 
@@ -48,6 +50,12 @@ cd Akita-Emergency-Response-Plugin
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+To install AERP itself and expose the `aerp` command instead:
+
+```bash
+pip install .
 ```
 
 3. Copy a config template.
@@ -90,11 +98,14 @@ If the config file does not exist, AERP creates a default JSON config at the pat
 
 ## GUI Dashboard
 
-AERP includes a beautiful, fully-featured dark-mode graphical dashboard (`customtkinter` required). To launch it:
+AERP includes a dark-mode graphical dashboard. Install its optional dependency and launch it with:
 
 ```bash
+pip install -r requirements-gui.txt
 python -m aerp.gui --config config/aerp_config.json
 ```
+
+An installed checkout can use `pip install ".[gui]"` followed by `aerp-gui`. In the connection field, use a serial path such as `/dev/ttyUSB0` or `COM3`, a hostname/IP address for TCP, or an explicit `serial://`/`tcp://` prefix.
 
 The GUI allows you to explicitly connect to a radio, monitor logs precisely, track incoming incidents, and manage broadcasts visually using a high-contrast Red/Black/Gray interface.
 
@@ -119,13 +130,15 @@ The GUI allows you to explicitly connect to a radio, monitor logs precisely, tra
 Edit `config/aerp_config.json` with these keys:
 
 - `interval`: seconds between broadcasts, must be greater than `0`
-- `emergency_port`: Meshtastic port number from `0` to `511`; all participating nodes must match
+- `emergency_port`: private Meshtastic application port from `256` to `511`; all participating nodes must match
 - `emergency_message`: default alert text
 - `alert_radius`: proximity-alert radius in meters; `0` disables it
 - `ack_timeout`: seconds before an ACK is considered stale
 - `plugin_enabled_by_default`: auto-start emergency broadcasting on launch when `true`
 
 The file must be valid JSON with no comments.
+
+`emergency_message` is limited to 80 JSON-encoded bytes so the message, emergency ID, and GPS coordinates can always fit in one Meshtastic packet. Optional battery, altitude, and sender-time fields are included only when space remains.
 
 ## Suggested Operator Workflow
 
@@ -134,7 +147,7 @@ The file must be valid JSON with no comments.
 3. Use `start` only for a real drill or incident; AERP begins recurring broadcasts immediately.
 4. Watch `status` for acknowledgements and other active emergencies on the mesh.
 5. Use `stop` when the incident is over so AERP halts broadcasts and sends `AERP_CLEAR`.
-6. If the process restarts after a resolved incident, use `clear` only when you need to manually clear the last recorded emergency ID.
+6. On graceful exit, AERP attempts to clear an active local emergency. On power loss or a severed radio connection, peers age the incident out after their received-emergency timeout.
 
 ## SAR Deployment Guidance
 
@@ -144,6 +157,7 @@ The file must be valid JSON with no comments.
 - Configure a fixed position on radios that may operate without live GPS. AERP can only include location that Meshtastic already knows about.
 - Run the CLI on stable, field-chargeable hardware such as a rugged laptop or Raspberry Pi with a power bank.
 - Perform radio-to-radio drills before deployment. LoRa coverage, terrain shadowing, and node placement matter more than application logic.
+- Use an encrypted Meshtastic channel with controlled keys. AERP trusts the authenticated mesh packet sender and does not add separate application-level signatures.
 
 ## Troubleshooting
 
@@ -160,6 +174,26 @@ Run the built-in regression checks with:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+Release validation also includes:
+
+```bash
+pip install -r requirements-dev.txt
+python -m compileall -q aerp tests
+python -m mypy aerp
+python -m build
+```
+
+## Pre-deployment Gate
+
+Automated checks cannot validate radios, RF conditions, channel keys, GPS acquisition, or field power. Before operational use:
+
+1. Install into a clean virtual environment using the exact artifact intended for deployment.
+2. Confirm every radio uses the same encrypted channel and `emergency_port`.
+3. Run a two-radio drill for EMERGENCY, directed ACK, repeated broadcast, and matching ALL CLEAR.
+4. Test serial/TCP disconnect and process shutdown behavior while an incident is active.
+5. Verify GPS, fixed-position fallback, battery telemetry, host clock, and log retention.
+6. Record the tested AERP, Python, Meshtastic, radio firmware, and configuration versions.
 
 ## License
 

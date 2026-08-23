@@ -1,0 +1,2 @@
+-r requirements.txt
+customtkinter>=5.2,<6

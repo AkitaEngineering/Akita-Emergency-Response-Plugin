@@ -29,20 +29,22 @@ import uuid
 import json # Needed for sending JSON payloads
 import base64
 import binascii
+import math
 from datetime import datetime # For formatting timestamps
+from typing import Any, Dict, Optional, Set, Tuple
 
-# Import pubsub explicitly if direct subscription is needed, though meshtastic usually handles it
-# from pubsub import pub
-
-import meshtastic.util # For PortNum constants if needed
 from meshtastic.protobuf import portnums_pb2
 from .constants import (
     MSG_TYPE_EMERGENCY, MSG_TYPE_ACK, MSG_TYPE_CLEAR,
-    CONFIG_INTERVAL, CONFIG_PORT, CONFIG_MESSAGE, CONFIG_RADIUS, CONFIG_ACK_TIMEOUT
+    CONFIG_INTERVAL, CONFIG_PORT, CONFIG_MESSAGE, CONFIG_RADIUS, CONFIG_ACK_TIMEOUT,
+    MAX_EMERGENCY_ID_CHARS, MAX_MESHTASTIC_PAYLOAD_BYTES, MAX_NODE_NUM,
+    MAX_RECEIVED_MESSAGE_CHARS, CLEAR_BROADCAST_REPETITIONS,
+    CLEAR_BROADCAST_SPACING_SECONDS,
 )
 from .utils import (
     build_gps_payload,
     calculate_distance,
+    extract_coordinates,
     extract_battery_level,
     get_location_from_packet,
     format_node_id,
@@ -82,18 +84,28 @@ class AERP:
         self.interface = interface
         self.config = config_manager
         self.emergency_active = False
-        self._emergency_thread = None # Internal thread reference
-        self._emergency_lock = threading.Lock() # Protects access to emergency_active and related state
-        self.last_emergency_id = None
-        self.last_sent_emergency_id = None
-        self.acknowledgements = {}
-        self.active_emergency_info = {}
-        self.my_node_num = None
+        self._emergency_thread: Optional[threading.Thread] = None
+        self._emergency_stop_event: Optional[threading.Event] = None
+        self._state_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        # Kept as an alias for compatibility with integrations that inspected
+        # the previous private attribute.
+        self._emergency_lock = self._state_lock
+        self._shutdown_event = threading.Event()
+        self._closed = False
+        self.last_emergency_id: Optional[str] = None
+        self.last_sent_emergency_id: Optional[str] = None
+        self.acknowledgements: Dict[str, Dict[int, float]] = {}
+        self._emergency_created_at: Dict[str, float] = {}
+        self.active_emergency_info: Dict[int, Dict[str, Any]] = {}
+        self._cleared_emergencies: Dict[Tuple[int, str], float] = {}
+        self._proximity_inside: Set[int] = set()
+        self.my_node_num: Optional[int] = None
         self.my_node_id = "Unknown"
 
         # Attempt to get initial node info
         self._update_node_info()
-        if not self.my_node_num:
+        if self.my_node_num is None:
              logger.warning("Could not get initial node info. Will retry on connection.")
 
         # Start background task for cleaning up stale data
@@ -107,7 +119,10 @@ class AERP:
         try:
             # Access myInfo directly from the interface object
             if self.interface and hasattr(self.interface, 'myInfo') and self.interface.myInfo:
-                self.my_node_num = self.interface.myInfo.my_node_num
+                node_num = self._normalize_node_num(self.interface.myInfo.my_node_num)
+                if node_num is None:
+                    raise ValueError("interface returned an invalid local node number")
+                self.my_node_num = node_num
                 self.my_node_id = format_node_id(self.my_node_num)
                 logger.info(f"AERP Initialized/Updated for node {self.my_node_id} ({self.my_node_num})")
                 return True
@@ -169,7 +184,7 @@ class AERP:
         """Return Meshtastic's enum alias for the configured port, if one exists."""
         try:
             return portnums_pb2.PortNum.Name(self.config.get(CONFIG_PORT))
-        except ValueError:
+        except (TypeError, ValueError):
             return None
 
     def _is_aerp_port(self, packet_port):
@@ -207,6 +222,54 @@ class AERP:
             logger.debug(f"Payload from {from_node_id_fmt} on port {port_num} is not valid UTF-8 JSON.")
             return None
 
+    @staticmethod
+    def _encode_payload(message_payload):
+        return json.dumps(
+            message_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @classmethod
+    def _payload_fits(cls, message_payload):
+        try:
+            return len(cls._encode_payload(message_payload)) <= MAX_MESHTASTIC_PAYLOAD_BYTES
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _normalize_node_num(value):
+        try:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, float) and not value.is_integer():
+                return None
+            normalized = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not 0 <= normalized <= MAX_NODE_NUM:
+            return None
+        return normalized
+
+    @staticmethod
+    def _valid_identifier(value):
+        return (
+            isinstance(value, str)
+            and 0 < len(value) <= MAX_EMERGENCY_ID_CHARS
+            and value == value.strip()
+            and value.isprintable()
+        )
+
+    @staticmethod
+    def _valid_timestamp(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        )
+
     def _send_aerp_payload(self, message_payload, port_num, description, destination_id="^all", want_ack=False):
         """Send a JSON-encoded AERP payload using the Meshtastic sendData API."""
         if not self.interface:
@@ -214,11 +277,13 @@ class AERP:
             return False
 
         try:
-            encoded_payload = json.dumps(
-                message_payload,
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ).encode('utf-8')
+            encoded_payload = self._encode_payload(message_payload)
+            if len(encoded_payload) > MAX_MESHTASTIC_PAYLOAD_BYTES:
+                logger.error(
+                    f"Cannot send {description}: encoded payload is {len(encoded_payload)} bytes; "
+                    f"Meshtastic permits {MAX_MESHTASTIC_PAYLOAD_BYTES}."
+                )
+                return False
             self.interface.sendData(
                 encoded_payload,
                 destinationId=destination_id,
@@ -226,6 +291,8 @@ class AERP:
                 wantAck=want_ack,
             )
             return True
+        except (TypeError, ValueError) as e:
+            logger.error(f"Cannot encode {description}: {e}")
         except AttributeError as e:
             logger.error(f"Meshtastic interface error sending {description}: {e}. Is it connected?")
         except Exception as e:
@@ -233,6 +300,11 @@ class AERP:
         return False
 
     def start_emergency(self):
+        """Start an emergency session and queue its first broadcast."""
+        with self._lifecycle_lock:
+            return self._start_emergency()
+
+    def _start_emergency(self):
         """
         Initiates the emergency broadcast state for this node.
 
@@ -242,38 +314,66 @@ class AERP:
         Returns:
             bool: True if the emergency state was successfully started, False otherwise.
         """
-        with self._emergency_lock:
+        with self._state_lock:
+            if self._closed:
+                logger.error("Cannot start emergency: AERP has been closed.")
+                return False
             if self.emergency_active:
                 logger.warning("Emergency broadcast is already active.")
                 return False
 
             # Ensure we have node info before starting
-            if not self.my_node_num:
+            if self.my_node_num is None:
                 logger.error("Cannot start emergency: My node ID is unknown. Ensure device is connected.")
                 # Attempt to update info again just in case
                 if not self._update_node_info():
                      return False
 
             # Generate a unique ID for this specific emergency event
+            previous_sent_emergency_id = self.last_sent_emergency_id
             self.last_emergency_id = str(uuid.uuid4())
             self.emergency_active = True
             # Initialize the acknowledgement dictionary for this new emergency ID
             self.acknowledgements[self.last_emergency_id] = {}
+            self._emergency_created_at[self.last_emergency_id] = time.time()
             self.last_sent_emergency_id = self.last_emergency_id
+            stop_event = threading.Event()
+            self._emergency_stop_event = stop_event
 
             logger.warning(f"--- EMERGENCY BROADCAST STARTED (ID: {self.last_emergency_id}) ---")
             logger.info(f"Broadcasting on port {self.config.get(CONFIG_PORT)} every {self.config.get(CONFIG_INTERVAL)} seconds.")
 
-            # Start the broadcast thread
-            if self._emergency_thread is None or not self._emergency_thread.is_alive():
-                self._emergency_thread = threading.Thread(target=self._send_emergency_broadcast_loop, name="AERPBroadcastThread")
-                self._emergency_thread.start()
-            else:
-                 logger.warning("Emergency thread already running? This shouldn't happen.")
+            current_emergency_id = self.last_emergency_id
 
-            return True
+        with self._state_lock:
+            if not self.emergency_active or self.last_emergency_id != current_emergency_id:
+                return False
+            # Serialize the first EMERGENCY against STOP/CLEAR so radio calls
+            # cannot be queued in the wrong order.
+            if not self._send_emergency_once(current_emergency_id):
+                self.emergency_active = False
+                self.last_emergency_id = None
+                self.last_sent_emergency_id = previous_sent_emergency_id
+                self.acknowledgements.pop(current_emergency_id, None)
+                self._emergency_created_at.pop(current_emergency_id, None)
+                stop_event.set()
+                logger.error("Emergency broadcast was not started because the first transmission failed.")
+                return False
+            self._emergency_thread = threading.Thread(
+                target=self._send_emergency_broadcast_loop,
+                args=(current_emergency_id, stop_event),
+                daemon=True,
+                name="AERPBroadcastThread",
+            )
+            self._emergency_thread.start()
+        return True
 
     def stop_emergency(self, send_clear=True):
+        """Stop the current session, optionally attempting an ALL CLEAR."""
+        with self._lifecycle_lock:
+            return self._stop_emergency(send_clear=send_clear)
+
+    def _stop_emergency(self, send_clear=True):
         """
         Stops the active emergency broadcast state for this node.
 
@@ -289,12 +389,15 @@ class AERP:
         was_active = False
         emergency_id_to_clear = None
 
-        with self._emergency_lock:
+        with self._state_lock:
             if self.emergency_active:
                 was_active = True
                 self.emergency_active = False # Signal the thread to stop
                 emergency_id_to_clear = self.last_emergency_id # Store ID before clearing
                 self.last_emergency_id = None # Clear the active ID immediately
+                stop_event = self._emergency_stop_event
+                if stop_event:
+                    stop_event.set()
                 logger.warning(f"--- EMERGENCY BROADCAST STOPPING (Last ID: {emergency_id_to_clear}) ---")
             else:
                 logger.info("Emergency broadcast is not currently active.")
@@ -303,30 +406,24 @@ class AERP:
         # Wait for the broadcast thread to finish its current loop and exit
         if self._emergency_thread and self._emergency_thread.is_alive():
             logger.debug("Waiting for broadcast thread to finish...")
-            # Calculate a reasonable timeout based on interval
-            timeout_duration = self.config.get(CONFIG_INTERVAL, 10) + 2 # Interval + buffer
-            self._emergency_thread.join(timeout=timeout_duration)
+            self._emergency_thread.join(timeout=2)
             if self._emergency_thread.is_alive():
                 logger.warning("Emergency broadcast thread did not stop gracefully within timeout.")
             else:
                  logger.debug("Broadcast thread finished.")
-            self._emergency_thread = None
+            if not self._emergency_thread.is_alive():
+                self._emergency_thread = None
 
         # Send the clear message if requested and possible
         if was_active and send_clear and emergency_id_to_clear:
-            if self.my_node_num: # Check if we can send
-                 self.send_clear_message(emergency_id_to_clear)
+            if self.my_node_num is not None:
+                 if not self.send_clear_message(emergency_id_to_clear):
+                     logger.error("Emergency stopped, but the ALL CLEAR transmission failed.")
             else:
                  logger.warning("Cannot send CLEAR message: Node info unknown (device likely disconnected).")
         elif was_active and send_clear and not emergency_id_to_clear:
              logger.warning("Wanted to send CLEAR, but no emergency ID was recorded.")
 
-
-        # Optional: Clear acknowledgements for the stopped session? Or keep for review?
-        # Decision: Keep them for review via status command until they time out naturally.
-        # if emergency_id_to_clear in self.acknowledgements:
-        #     logger.debug(f"Clearing acknowledgements for stopped emergency ID {emergency_id_to_clear}")
-        #     del self.acknowledgements[emergency_id_to_clear]
 
         return was_active
 
@@ -339,98 +436,104 @@ class AERP:
         Args:
             emergency_id (str): The unique ID of the emergency session to clear.
         """
-        if not self.my_node_num:
+        if self.my_node_num is None:
             logger.error("Cannot send clear message: My node ID is unknown.")
-            return
-        if not emergency_id:
+            return False
+        if not self._valid_identifier(emergency_id):
             logger.error("Cannot send clear message: No emergency ID provided.")
-            return
+            return False
 
         message_payload = {
             "type": MSG_TYPE_CLEAR,
-            "user_node_num": self.my_node_num, # Include sender node number
             "emergency_id": emergency_id,      # The ID being cleared
-            "timestamp": time.time()           # Time the clear was sent
+            "timestamp": int(time.time())      # Time the clear was sent
         }
         port_num = self.config.get(CONFIG_PORT)
 
         logger.info(f"Sending ALL CLEAR for emergency ID {emergency_id} on port {port_num}")
         logger.debug(f"Clear Payload: {message_payload}")
 
-        self._send_aerp_payload(
-            message_payload,
+        all_queued = True
+        for attempt in range(CLEAR_BROADCAST_REPETITIONS):
+            queued = self._send_aerp_payload(
+                message_payload,
+                port_num,
+                description="CLEAR message",
+                want_ack=False,
+            )
+            all_queued = all_queued and queued
+            if attempt + 1 < CLEAR_BROADCAST_REPETITIONS:
+                time.sleep(CLEAR_BROADCAST_SPACING_SECONDS)
+        return all_queued
+
+    def _build_emergency_payload(self, emergency_id):
+        """Build a one-packet emergency payload in safety-priority order."""
+        gps_info = self._get_local_position_payload()
+        normalized_gps = {}
+        if gps_info:
+            normalized_gps = {
+                "latitude": round(gps_info["latitude"], 7),
+                "longitude": round(gps_info["longitude"], 7),
+            }
+
+        payload = {
+            "type": MSG_TYPE_EMERGENCY,
+            "emergency_id": emergency_id,
+            "message": self.config.get(CONFIG_MESSAGE),
+            "gps": normalized_gps,
+        }
+        if not self._payload_fits(payload):
+            logger.error("Configured emergency message cannot fit with core AERP fields in one packet.")
+            return None
+
+        optional_fields = [
+            ("timestamp", int(time.time())),
+            ("battery", self._get_local_battery_level()),
+        ]
+        altitude = gps_info.get("altitude") if gps_info else None
+        for key, value in optional_fields:
+            if value is None:
+                continue
+            candidate = dict(payload)
+            candidate[key] = value
+            if self._payload_fits(candidate):
+                payload = candidate
+
+        if altitude is not None:
+            candidate = dict(payload)
+            candidate["gps"] = dict(payload["gps"], altitude=altitude)
+            if self._payload_fits(candidate):
+                payload = candidate
+        return payload
+
+    def _send_emergency_once(self, emergency_id):
+        payload = self._build_emergency_payload(emergency_id)
+        if payload is None:
+            return False
+        port_num = self.config.get(CONFIG_PORT)
+        logger.info(f"Sending emergency broadcast (ID: {emergency_id}) on port {port_num}")
+        logger.debug(f"Emergency Payload: {payload}")
+        return self._send_aerp_payload(
+            payload,
             port_num,
-            description="CLEAR message",
+            description="EMERGENCY message",
             want_ack=False,
         )
 
-    def _send_emergency_broadcast_loop(self):
+    def _send_emergency_broadcast_loop(self, current_emergency_id, stop_event):
         """
         Internal method run in a dedicated thread.
         Periodically gathers data (GPS, battery) and sends the emergency broadcast message
         as long as `self.emergency_active` is True.
         """
         interval = self.config.get(CONFIG_INTERVAL)
-        port_num = self.config.get(CONFIG_PORT)
-        emergency_msg_text = self.config.get(CONFIG_MESSAGE)
-        current_emergency_id = None # Store the ID for this thread's session
-
-        with self._emergency_lock:
-             current_emergency_id = self.last_emergency_id # Get ID safely
-
-        if not current_emergency_id:
-             logger.error("Broadcast thread started without a valid emergency ID. Exiting.")
-             return
-
         logger.debug(f"Broadcast thread started for emergency ID: {current_emergency_id}")
-
-        while True:
-            # Check if emergency should stop *before* doing work
-            with self._emergency_lock:
+        while not stop_event.wait(interval):
+            with self._state_lock:
                 if not self.emergency_active or self.last_emergency_id != current_emergency_id:
-                    logger.debug(f"Emergency state changed (active={self.emergency_active}, id={self.last_emergency_id}). Broadcast thread exiting.")
-                    break # Exit loop if emergency stopped or ID changed
-
-            # --- Gather Data ---
-            gps_info = self._get_local_position_payload()
-            if not gps_info:
-                logger.debug("Could not get valid GPS position for emergency message.")
-
-            battery_level = self._get_local_battery_level()
-            if battery_level is None:
-                logger.debug("Could not get battery level for emergency message.")
-
-
-            # --- Construct and Send Payload ---
-            message_payload = {
-                "type": MSG_TYPE_EMERGENCY,
-                "user_node_num": self.my_node_num, # Include sender node number for identification
-                "emergency_id": current_emergency_id, # Include the unique ID for this session
-                "message": emergency_msg_text,
-                "gps": gps_info, # Send collected GPS data (or empty dict)
-                "battery": battery_level, # Send collected battery level (or None)
-                "timestamp": time.time() # System time of sending
-            }
-
-            logger.info(f"Sending emergency broadcast (ID: {current_emergency_id}) on port {port_num}")
-            logger.debug(f"Emergency Payload: {message_payload}")
-
-            self._send_aerp_payload(
-                message_payload,
-                port_num,
-                description="EMERGENCY message",
-                want_ack=False,
-            )
-
-            # --- Wait for Interval ---
-            # Check the active flag *again* immediately before sleeping
-            # to handle rapid start/stop commands gracefully.
-            with self._emergency_lock:
-                if not self.emergency_active or self.last_emergency_id != current_emergency_id:
-                    logger.debug("Emergency state changed during send cycle. Exiting loop.")
                     break
-            # Wait for the configured interval before the next broadcast
-            time.sleep(interval)
+                # Keep STOP/CLEAR ordered after any broadcast already in flight.
+                self._send_emergency_once(current_emergency_id)
 
         logger.info(f"Emergency broadcast thread finished for ID: {current_emergency_id}.")
 
@@ -453,26 +556,26 @@ class AERP:
         """
         try:
             # Basic packet validation
-            if not isinstance(packet, dict) or 'decoded' not in packet or 'payload' not in packet['decoded']:
-                # logger.debug("Packet missing decoded payload, ignoring.")
+            if not isinstance(packet, dict) or not isinstance(packet.get('decoded'), dict):
                 return
 
             decoded_part = packet['decoded']
             port_num = decoded_part.get('portnum', decoded_part.get('portNum')) # Can be int or string ('PRIVATE_APP', 'TEXT_MESSAGE_APP', etc.)
-            payload = decoded_part.get('payload') # Can be bytes, dict (if auto-decoded JSON), string etc.
-            from_node_num = packet.get('from')
-            to_node_num = packet.get('to') # Useful for checking if message was direct or broadcast
+            payload = decoded_part.get('payload')
+            from_node_num = self._normalize_node_num(packet.get('from'))
+            if from_node_num is None:
+                logger.debug("Ignoring packet with a missing or invalid sender node number.")
+                return
 
             # Ignore packets sent by ourselves
             if from_node_num == self.my_node_num:
-                # logger.debug(f"Ignoring packet from self ({format_node_id(from_node_num)})")
                 return
 
             from_node_id_fmt = format_node_id(from_node_num) # Formatted ID for logging
 
             # --- Attempt to Decode Payload if Bytes ---
             # Meshtastic library sometimes provides payload as bytes, try decoding as JSON
-            decoded_payload = self._decode_payload(payload, from_node_id_fmt, port_num)
+            decoded_payload = self._decode_payload(payload, from_node_id_fmt, port_num) if payload is not None else None
 
             # --- Route based on Port Number and Message Type ---
             target_port = self.config.get(CONFIG_PORT)
@@ -487,16 +590,21 @@ class AERP:
                         self._handle_ack_message(packet, decoded_payload, from_node_num, from_node_id_fmt)
                     elif message_type == MSG_TYPE_CLEAR:
                         self._handle_clear_message(packet, decoded_payload, from_node_num, from_node_id_fmt)
-                    # Add handlers for other AERP message types here
                     else:
                         logger.debug(f"Received message with unknown type '{message_type}' on AERP port {target_port} from {from_node_id_fmt}.")
                 else:
                     # Received something on AERP port, but it's not a recognized AERP JSON structure
-                    logger.info(f"Received non-AERP (or non-JSON) data on AERP port {target_port} from {from_node_id_fmt}. Payload: {payload}")
+                    payload_size = len(payload) if isinstance(payload, (bytes, str)) else "unknown"
+                    logger.info(
+                        f"Received non-AERP data on AERP port {target_port} from "
+                        f"{from_node_id_fmt} (payload size: {payload_size})."
+                    )
 
             # 2. Check *any* packet for Position Data (for Proximity Alert)
             # This allows alerts even if nodes aren't running AERP but are sending standard position updates.
             lat, lon = get_location_from_packet(packet) # Util function checks POSITION_APP and embedded 'gps'
+            if (lat is None or lon is None) and isinstance(decoded_payload, dict):
+                lat, lon = extract_coordinates(decoded_payload.get("gps"))
             if lat is not None and lon is not None:
                  # We already ignored packets from self earlier
                  self.check_alert_radius(packet, lat, lon, from_node_num, from_node_id_fmt)
@@ -509,36 +617,76 @@ class AERP:
     def _handle_emergency_message(self, packet, payload, from_node_num, from_node_id_fmt):
         """Handles a received AERP_EMERGENCY message."""
         emergency_id = payload.get("emergency_id")
+        if not self._valid_identifier(emergency_id):
+            logger.warning(f"Ignoring malformed emergency from {from_node_id_fmt}: invalid emergency ID.")
+            return
+
         message_text = payload.get("message", "[No message text]")
-        gps_info = payload.get("gps") # This should be a dict if present
-        battery_level = payload.get("battery") # Integer or None
-        timestamp = payload.get("timestamp", time.time()) # Use receive time if sender didn't include
+        if not isinstance(message_text, str):
+            logger.warning(f"Ignoring malformed emergency from {from_node_id_fmt}: message is not text.")
+            return
+        if len(message_text) > MAX_RECEIVED_MESSAGE_CHARS:
+            message_text = message_text[:MAX_RECEIVED_MESSAGE_CHARS]
+            logger.warning(f"Truncated oversized emergency text received from {from_node_id_fmt}.")
+        message_text = "".join(character if character.isprintable() else " " for character in message_text)
+
+        gps_info = build_gps_payload(payload.get("gps"))
+        battery_level = extract_battery_level({"batteryLevel": payload.get("battery")})
+        received_at = time.time()
+        sender_timestamp = payload.get("timestamp")
+        if not self._valid_timestamp(sender_timestamp):
+            sender_timestamp = None
+
+        with self._state_lock:
+            cleared_at = self._cleared_emergencies.get((from_node_num, emergency_id))
+            current_info = self.active_emergency_info.get(from_node_num)
+        if cleared_at is not None:
+            logger.info(
+                f"Ignoring delayed emergency {emergency_id} from {from_node_id_fmt}; "
+                "an ALL CLEAR was already received."
+            )
+            return
+        if current_info and current_info.get("message_id") != emergency_id:
+            current_sender_timestamp = current_info.get("timestamp")
+            if (
+                sender_timestamp is not None
+                and self._valid_timestamp(current_sender_timestamp)
+                and sender_timestamp < current_sender_timestamp
+            ):
+                logger.info(
+                    f"Ignoring out-of-order emergency {emergency_id} from {from_node_id_fmt}; "
+                    f"newer incident {current_info.get('message_id')} is already active."
+                )
+                return
 
         # Log the emergency prominently
         logger.warning(f"*** EMERGENCY MESSAGE RECEIVED from {from_node_id_fmt} (ID: {emergency_id}) ***")
         logger.warning(f"    Message: {message_text}")
-        if isinstance(gps_info, dict) and 'latitude' in gps_info and 'longitude' in gps_info:
+        if gps_info:
              logger.warning(f"    GPS: Lat {gps_info['latitude']:.5f}, Lon {gps_info['longitude']:.5f} (Alt: {gps_info.get('altitude', 'N/A')})")
         else:
              logger.warning(f"    GPS: Not Available or Invalid Format")
         logger.warning(f"    Battery: {battery_level if battery_level is not None else 'N/A'}%")
         try:
             # Format timestamp for readability
-            log_time = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S %Z')
+            display_timestamp = sender_timestamp if sender_timestamp is not None else received_at
+            log_time = datetime.fromtimestamp(display_timestamp).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
             logger.warning(f"    Timestamp: {log_time}")
         except Exception:
-             logger.warning(f"    Timestamp: {timestamp} (Could not format)")
+             logger.warning(f"    Timestamp: {sender_timestamp} (Could not format)")
 
 
         # Store info about this active emergency (overwrite if already present for this node)
-        self.active_emergency_info[from_node_num] = {
-            "message_id": emergency_id,
-            "timestamp": timestamp, # Store the original timestamp
-            "message": message_text,
-            "gps": gps_info,
-            "battery": battery_level,
-            "last_seen": time.time() # Track when we last heard from them
-        }
+        with self._state_lock:
+            self.active_emergency_info[from_node_num] = {
+                "message_id": emergency_id,
+                "timestamp": sender_timestamp,
+                "message": message_text,
+                "gps": gps_info,
+                "battery": battery_level,
+                "received_at": received_at,
+                "last_seen": received_at,
+            }
 
         # Send acknowledgement back to the sender
         if emergency_id:
@@ -549,23 +697,33 @@ class AERP:
     def _handle_ack_message(self, packet, payload, from_node_num, from_node_id_fmt):
         """Handles a received AERP_ACK message."""
         original_emergency_id = payload.get("emergency_id")
-        ack_timestamp = payload.get("timestamp", time.time()) # Sender's timestamp of ACK
+        if not self._valid_identifier(original_emergency_id):
+            logger.debug(f"Ignoring malformed ACK from {from_node_id_fmt}.")
+            return
+        ack_received_at = time.time()
         # The node number of the device sending the ACK is 'from_node_num'
         ack_sender_node_num = from_node_num # Clarify variable name
 
         # Check if this ACK is for an emergency *we* initiated
-        if original_emergency_id and original_emergency_id in self.acknowledgements:
+        with self._state_lock:
+            known_emergency = original_emergency_id in self.acknowledgements
+            already_received = (
+                known_emergency
+                and ack_sender_node_num in self.acknowledgements[original_emergency_id]
+            )
+            if known_emergency:
+                self.acknowledgements[original_emergency_id][ack_sender_node_num] = ack_received_at
+
+        if known_emergency:
             # Record the ACK with the sender's node ID and timestamp
             # Check if we already have an ACK from this node for this ID
-            if ack_sender_node_num not in self.acknowledgements[original_emergency_id]:
+            if not already_received:
                 logger.info(f"Acknowledgement RECEIVED for My Emergency ID {original_emergency_id} from Node {from_node_id_fmt}")
             else:
                 # We received another ACK from the same node for the same emergency
                 # Update the timestamp (they might have restarted or resent)
                 logger.debug(f"Acknowledgement REFRESHED for My Emergency ID {original_emergency_id} from Node {from_node_id_fmt}")
 
-            # Store the timestamp of when the ACK was *sent* by the acknowledging node
-            self.acknowledgements[original_emergency_id][ack_sender_node_num] = ack_timestamp
         else:
             # This could be an ACK for another node's emergency, or an old/invalid ID.
             logger.debug(f"Received ACK from {from_node_id_fmt} for emergency {original_emergency_id}, which is not mine or is unknown/stale.")
@@ -573,22 +731,29 @@ class AERP:
     def _handle_clear_message(self, packet, payload, from_node_num, from_node_id_fmt):
         """Handles a received AERP_CLEAR message."""
         emergency_id = payload.get("emergency_id")
-        timestamp = payload.get("timestamp", time.time()) # Time the clear was sent
+        if not self._valid_identifier(emergency_id):
+            logger.warning(f"Ignoring malformed ALL CLEAR from {from_node_id_fmt}: invalid emergency ID.")
+            return
+        received_at = time.time()
 
         logger.info(f"--- ALL CLEAR RECEIVED from {from_node_id_fmt} for Emergency ID: {emergency_id} ---")
 
         # Remove the emergency info we were tracking for this sender node
-        if from_node_num in self.active_emergency_info:
-            # Optional: Check if the emergency_id matches the one we stored for this node
-            stored_id = self.active_emergency_info[from_node_num].get("message_id")
+        with self._state_lock:
+            self._cleared_emergencies[(from_node_num, emergency_id)] = received_at
+            current_info = self.active_emergency_info.get(from_node_num)
+            stored_id = current_info.get("message_id") if current_info else None
+            if stored_id == emergency_id:
+                del self.active_emergency_info[from_node_num]
+
+        if current_info:
             if stored_id == emergency_id:
                 logger.debug(f"Removing tracked emergency info for node {from_node_id_fmt} matching CLEAR ID.")
-            elif stored_id:
-                 logger.warning(f"Received CLEAR from {from_node_id_fmt} with ID {emergency_id}, but tracked ID was {stored_id}. Removing tracked info anyway.")
             else:
-                 logger.debug(f"Received CLEAR from {from_node_id_fmt} (ID: {emergency_id}). Removing tracked info (which had no ID).")
-
-            del self.active_emergency_info[from_node_num]
+                 logger.warning(
+                     f"Received CLEAR from {from_node_id_fmt} for ID {emergency_id}, "
+                     f"but current tracked ID is {stored_id}; retaining the current emergency."
+                 )
         else:
             # We received a clear, but weren't tracking an active emergency from them.
             logger.info(f"Received CLEAR for node {from_node_id_fmt} (ID: {emergency_id}), but no active emergency was tracked for them.")
@@ -605,22 +770,21 @@ class AERP:
             destination_node_num (int): The node number to send the ACK to.
             emergency_id (str): The unique ID of the emergency being acknowledged.
         """
-        if not self.my_node_num:
+        if self.my_node_num is None:
             logger.error("Cannot send acknowledgement: My node ID is unknown.")
-            return
-        if not destination_node_num:
+            return False
+        destination_node_num = self._normalize_node_num(destination_node_num)
+        if destination_node_num is None:
             logger.error("Cannot send acknowledgement: Destination node number is missing.")
-            return
-        if not emergency_id:
+            return False
+        if not self._valid_identifier(emergency_id):
              logger.error("Cannot send acknowledgement: Emergency ID is missing.")
-             return
+             return False
 
         ack_payload = {
             "type": MSG_TYPE_ACK,
             "emergency_id": emergency_id,      # The ID being acknowledged
-            # "ack_sender_node_num": self.my_node_num, # Implicitly the 'from' field, but can include for clarity if needed
-            "timestamp": time.time()           # Time the ACK is being sent
-            # Could add optional fields like ACK sender's GPS/Battery here if useful for context
+            "timestamp": int(time.time())      # Time the ACK is being sent
         }
         port_num = self.config.get(CONFIG_PORT)
         dest_node_id_fmt = format_node_id(destination_node_num)
@@ -629,12 +793,12 @@ class AERP:
         logger.debug(f"ACK Payload: {ack_payload}")
 
         destination_id_str = f"!{destination_node_num:08x}"
-        self._send_aerp_payload(
+        return self._send_aerp_payload(
             ack_payload,
             port_num,
             description=f"ACK message to {dest_node_id_fmt}",
             destination_id=destination_id_str,
-            want_ack=False,
+            want_ack=True,
         )
 
 
@@ -675,14 +839,20 @@ class AERP:
 
         # Check if within radius and log alert
         if distance <= alert_radius:
-            # Potential enhancement: Keep track of nodes already alerted recently
-            # to avoid spamming logs for nodes lingering on the edge.
-            # e.g., self.recently_alerted[from_node_num] = time.time()
-            logger.warning(f"*** PROXIMITY ALERT: Node {from_node_id_fmt} is within alert radius ({distance:.1f}m <= {alert_radius}m) ***")
-            # Trigger further actions if needed (e.g., sound alarm, display notification via another mechanism)
-        # else:
-            # Optional: Log when a node moves *out* of the radius if tracking state
-            # logger.info(f"Node {from_node_id_fmt} is outside alert radius ({distance:.2f}m > {alert_radius}m)")
+            with self._state_lock:
+                newly_inside = from_node_num not in self._proximity_inside
+                self._proximity_inside.add(from_node_num)
+            if newly_inside:
+                logger.warning(f"*** PROXIMITY ALERT: Node {from_node_id_fmt} is within alert radius ({distance:.1f}m <= {alert_radius}m) ***")
+        else:
+            with self._state_lock:
+                was_inside = from_node_num in self._proximity_inside
+                self._proximity_inside.discard(from_node_num)
+            if was_inside:
+                logger.info(
+                    f"Node {from_node_id_fmt} left the alert radius "
+                    f"({distance:.1f}m > {alert_radius}m)."
+                )
 
 
     # --- Background Cleanup ---
@@ -695,16 +865,15 @@ class AERP:
         - Information about *received* emergencies that haven't been updated recently.
         """
         logger.info("AERP Cleanup thread starting.")
-        while True:
+        while not self._shutdown_event.is_set():
             ack_timeout = self.config.get(CONFIG_ACK_TIMEOUT)
-            # Use a potentially longer timeout for inactive received emergencies
-            # Consider making this configurable as well?
             received_emergency_timeout = max(ack_timeout * 3, 600) # At least 10 minutes
 
             # --- Wait first before cleaning ---
             # Sleep interval: Check roughly twice per ACK timeout period, but not too frequently.
             sleep_duration = max(30, ack_timeout // 2)
-            time.sleep(sleep_duration)
+            if self._shutdown_event.wait(sleep_duration):
+                break
 
             logger.debug(f"Running background cleanup (ACK Timeout: {ack_timeout}s, Received Timeout: {received_emergency_timeout}s)")
             current_time = time.time()
@@ -713,7 +882,20 @@ class AERP:
                 # --- Clean stale acknowledgements for *our* emergencies ---
                 # Use list() to avoid issues modifying dict during iteration
                 stale_acks_found = False
-                for emergency_id, nodes in list(self.acknowledgements.items()):
+                with self._state_lock:
+                    acknowledgement_snapshot = {
+                        emergency_id: dict(nodes)
+                        for emergency_id, nodes in self.acknowledgements.items()
+                    }
+                    emergency_snapshot = {
+                        node_num: dict(info)
+                        for node_num, info in self.active_emergency_info.items()
+                    }
+                    cleared_snapshot = dict(self._cleared_emergencies)
+                    emergency_created_snapshot = dict(self._emergency_created_at)
+                    active_local_id = self.last_emergency_id
+
+                for emergency_id, nodes in acknowledgement_snapshot.items():
                     # Also remove ACK lists for emergencies that are no longer active *and* old
                     # (Requires knowing which IDs are truly old, not just inactive)
                     # Simpler: Just remove stale ACKs within each list based on timestamp.
@@ -726,21 +908,29 @@ class AERP:
                     if acks_to_remove:
                         logger.debug(f"Cleaning stale ACKs for Emergency ID {emergency_id}...")
                         for node_num in acks_to_remove:
-                            if emergency_id in self.acknowledgements and node_num in self.acknowledgements[emergency_id]:
+                            with self._state_lock:
+                                current_timestamp = self.acknowledgements.get(emergency_id, {}).get(node_num)
+                                if current_timestamp != nodes[node_num]:
+                                    continue
                                 del self.acknowledgements[emergency_id][node_num]
                                 logger.debug(f" - Removed stale ACK from {format_node_id(node_num)}")
-                        # Optional: Remove the emergency_id key itself if no ACKs remain?
-                        # if not self.acknowledgements[emergency_id]:
-                        #     logger.debug(f"Removing empty ACK list for Emergency ID {emergency_id}")
-                        #     del self.acknowledgements[emergency_id]
+
+                    created_at = emergency_created_snapshot.get(emergency_id, current_time)
+                    if emergency_id != active_local_id and current_time - created_at > ack_timeout:
+                        with self._state_lock:
+                            if self._emergency_created_at.get(emergency_id) == created_at:
+                                self.acknowledgements.pop(emergency_id, None)
+                                self._emergency_created_at.pop(emergency_id, None)
 
 
                 # --- Clean stale *received* emergency info ---
                 stale_emergencies_found = False
                 nodes_to_remove = []
-                for node_num, info in list(self.active_emergency_info.items()):
+                for node_num, info in emergency_snapshot.items():
                     # Check based on when we last saw *any* message from them related to this
-                    last_seen_time = info.get("last_seen", info.get("timestamp", 0)) # Use 'last_seen' if available
+                    last_seen_time = info.get("last_seen", info.get("timestamp", 0))
+                    if not self._valid_timestamp(last_seen_time):
+                        last_seen_time = 0
                     if current_time - last_seen_time > received_emergency_timeout:
                         nodes_to_remove.append(node_num)
                         stale_emergencies_found = True
@@ -748,19 +938,27 @@ class AERP:
                 if nodes_to_remove:
                     logger.debug(f"Cleaning stale received emergency info (timeout: {received_emergency_timeout}s)...")
                     for node_num in nodes_to_remove:
-                        if node_num in self.active_emergency_info:
+                        with self._state_lock:
+                            current_info = self.active_emergency_info.get(node_num)
+                            if not current_info or current_info.get("last_seen") != emergency_snapshot[node_num].get("last_seen"):
+                                continue
                             del self.active_emergency_info[node_num]
                             logger.info(f"Removed stale tracked emergency info for node {format_node_id(node_num)}")
+
+                for key, cleared_at in cleared_snapshot.items():
+                    if current_time - cleared_at > received_emergency_timeout:
+                        with self._state_lock:
+                            if self._cleared_emergencies.get(key) == cleared_at:
+                                del self._cleared_emergencies[key]
 
                 if not stale_acks_found and not stale_emergencies_found:
                     logger.debug("Background cleanup ran, no stale data found.")
 
-            except Exception as e:
+            except Exception:
                 # Log errors in the cleanup thread but keep the thread running
                 logger.exception("Error during AERP background cleanup task.")
 
-        # This part of the loop should ideally not be reached if daemon=True
-        # logger.info("AERP Cleanup thread stopping.")
+        logger.debug("AERP cleanup thread stopped.")
 
 
     # --- Status and Connection Handling ---
@@ -776,37 +974,61 @@ class AERP:
             dict: A dictionary summarizing the plugin's status.
         """
         # Create copies or format data to avoid returning internal mutable state directly
-        formatted_acks = {}
-        current_active_id = self.last_emergency_id # Get potentially active ID
+        with self._state_lock:
+            current_active_id = self.last_emergency_id
+            emergency_active = self.emergency_active
+            acknowledgement_snapshot = {
+                emergency_id: dict(nodes)
+                for emergency_id, nodes in self.acknowledgements.items()
+            }
+            emergency_snapshot = {
+                node_num: dict(info)
+                for node_num, info in self.active_emergency_info.items()
+            }
+            my_node_id = self.my_node_id
+            config_snapshot = dict(self.config.config)
+
+        formatted_acks: Dict[str, Dict[str, str]] = {}
 
         # Format acknowledgements for the *currently active* emergency ID if one exists
-        if current_active_id and current_active_id in self.acknowledgements:
+        if current_active_id and current_active_id in acknowledgement_snapshot:
              formatted_acks[current_active_id] = {
-                  format_node_id(n): datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-                  for n, ts in self.acknowledgements[current_active_id].items()
+                  format_node_id(n): self._format_timestamp(ts)
+                  for n, ts in acknowledgement_snapshot[current_active_id].items()
              }
-        # Optionally include ACKs for past IDs? For now, focus on current.
 
         formatted_received_emergencies = {}
-        for node_num, info in self.active_emergency_info.items():
+        for node_num, info in emergency_snapshot.items():
+            sent_timestamp = info.get("timestamp")
+            received_timestamp = info.get("received_at", info.get("last_seen"))
             formatted_received_emergencies[format_node_id(node_num)] = {
                 "emergency_id": info.get("message_id"),
                 "message": info.get("message"),
                 "gps": info.get("gps"),
                 "battery": info.get("battery"),
-                "received_at": datetime.fromtimestamp(info.get("timestamp", 0)).strftime('%Y-%m-%d %H:%M:%S'),
-                "last_seen": datetime.fromtimestamp(info.get("last_seen", 0)).strftime('%Y-%m-%d %H:%M:%S')
+                "sent_at": self._format_timestamp(sent_timestamp) if sent_timestamp is not None else "Unknown",
+                "received_at": self._format_timestamp(received_timestamp),
+                "last_seen": self._format_timestamp(info.get("last_seen")),
             }
 
         status = {
-            "my_node_id": self.my_node_id,
-            "emergency_active": self.emergency_active,
+            "my_node_id": my_node_id,
+            "emergency_active": emergency_active,
             "last_emergency_id": current_active_id,
-            "active_acknowledgements": formatted_acks.get(current_active_id, {}), # Show ACKs for current ID
+            "active_acknowledgements": formatted_acks.get(current_active_id, {}) if current_active_id else {},
             "active_received_emergencies": formatted_received_emergencies,
-            "config": self.config.config # Show current config (might be verbose)
+            "config": config_snapshot,
         }
         return status
+
+    @classmethod
+    def _format_timestamp(cls, value):
+        if not cls._valid_timestamp(value):
+            return "Unknown"
+        try:
+            return datetime.fromtimestamp(value).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+        except (OSError, OverflowError, ValueError):
+            return "Unknown"
 
     def on_connection_change(self, interface, connected):
         """
@@ -821,8 +1043,8 @@ class AERP:
         """
         if connected:
             logger.info("Meshtastic device connected.")
-            # Attempt to update node info, especially if it was unknown
-            time.sleep(2) # Give the interface a moment to populate info after connect event
+            if interface is not None:
+                self.interface = interface
             self._update_node_info()
         else:
             logger.warning("Meshtastic device disconnected.")
@@ -833,3 +1055,17 @@ class AERP:
             self.my_node_id = "Unknown"
             logger.info("AERP node info reset due to disconnection.")
 
+    def close(self, send_clear=True):
+        """Stop workers and release this instance's runtime state.
+
+        The Meshtastic interface is owned by the CLI/GUI and is deliberately
+        not closed here.
+        """
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.stop_emergency(send_clear=send_clear)
+        self._shutdown_event.set()
+        if self._cleanup_thread.is_alive() and threading.current_thread() is not self._cleanup_thread:
+            self._cleanup_thread.join(timeout=2)

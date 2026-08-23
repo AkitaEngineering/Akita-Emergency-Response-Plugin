@@ -20,12 +20,8 @@ Akita Emergency Response Plugin (AERP) Package Initialization.
 This file makes the 'aerp' directory a Python package.
 """
 
-# Optionally, you could import key classes/functions here for easier access
-# from package root, e.g., `from aerp import AERP`.
-# However, keeping imports explicit within modules is often clearer.
-
-# Define package-level metadata (optional but good practice)
-__version__ = "1.0.0"
+# Package metadata
+__version__ = "1.1.0"
 __author__ = "Akita Engineering"
 __license__ = "GPLv3"
-__email__ = "support@akitaengineering.com" # Replace with actual contact if desired
+__email__ = "support@akitaengineering.com"

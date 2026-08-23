@@ -1,7 +1,3 @@
-# Dependencies for Akita Emergency Response Plugin (AERP)
-# Install using: pip install -r requirements.txt
-
-meshtastic>=2.2.0 # Requires a recent version for pubsub and API features
-pypubsub>=4.0.3   # Explicitly include pubsub if needed, though often bundled with meshtastic
-customtkinter>=5.2.0 # For the GUI Dashboard
-customtkinter>=5.2.0
+# Runtime dependencies for the AERP CLI.
+meshtastic>=2.7,<3
+pypubsub>=4.0.3,<5
